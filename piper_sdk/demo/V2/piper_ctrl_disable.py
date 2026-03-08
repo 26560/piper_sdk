@@ -7,9 +7,13 @@ from piper_sdk import *
 
 # 测试代码
 if __name__ == "__main__":
-    piper = C_PiperInterface_V2()
+    piper = C_PiperInterface_V2("pipercan0", False)
     piper.ConnectPort()
-    while(piper.DisablePiper()):
-        time.sleep(0.01)
+    # while(piper.DisablePiper()):
+    #     time.sleep(0.01)
+    for i in range(1,7):
+        print(i)
+        time.sleep(3)
+        piper.DisableArm(i)
     print("失能成功!!!!")
     

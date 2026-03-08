@@ -10,7 +10,7 @@ Inner class identifies instances based on `can_port`, preventing the creation of
 
 ### Constructor Parameters
 
-- `can_name` (str, default="can0"): CAN port name
+- `can_name` (str, default="pipercan0"): CAN port name
 - `judge_flag` (bool, default=True): Determines if the CAN port is functioning correctly. When using a PCIe-to-CAN module, set to false.
 - `can_auto_init` (bool, default=True): Determines if the CAN port is automatically initialized.
 - `dh_is_offset` (int, default=0): Does the j1-j2 offset by 2° in the DH parameters?

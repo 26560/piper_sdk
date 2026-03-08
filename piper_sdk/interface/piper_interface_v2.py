@@ -347,7 +347,7 @@ class C_PiperInterface_V2():
     _lock = threading.Lock()
 
     def __new__(cls, 
-                can_name:str="can0", 
+                can_name:str="pipercan0", 
                 judge_flag=True,
                 can_auto_init=True,
                 # reconnect_after_disconnection:bool = False,
@@ -371,7 +371,7 @@ class C_PiperInterface_V2():
         return cls._instances[key]
 
     def __init__(self,
-                can_name:str="can0",
+                can_name:str="pipercan0",
                 judge_flag=True,
                 can_auto_init=True,
                 # reconnect_after_disconnection:bool = False,
@@ -538,7 +538,7 @@ class C_PiperInterface_V2():
         self._initialized = True  # 标记已初始化
     
     @classmethod
-    def get_instance(cls, can_name="can0", judge_flag=True, can_auto_init=True):
+    def get_instance(cls, can_name="pipercan0", judge_flag=True, can_auto_init=True):
         '''Get a class instance object
 
         Returns:

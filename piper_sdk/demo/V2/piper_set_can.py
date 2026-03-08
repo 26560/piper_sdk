@@ -11,7 +11,7 @@ from piper_sdk import *
 
 # 测试代码
 if __name__ == "__main__":
-    piper = C_PiperInterface_V2(can_auto_init=False)
+    piper = C_PiperInterface_V2("pipercan0", False, can_auto_init=False)
     piper.CreateCanBus(can_name="/dev/ttyACM0",
                        bustype="slcan",
                        expected_bitrate=1000000,

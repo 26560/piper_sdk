@@ -5,7 +5,7 @@ import time
 from piper_sdk import *
 
 if __name__ == "__main__":
-    piper = C_PiperInterface_V2("can0")
+    piper = C_PiperInterface_V2("pipercan0", False)
     piper.ConnectPort()
     while( not piper.EnablePiper()):
         time.sleep(0.01)
@@ -37,7 +37,7 @@ if __name__ == "__main__":
         piper.MotionCtrl_2(0x01, 0x01, 100, 0x00)
         piper.JointCtrl(joint_0, joint_1, joint_2, joint_3, joint_4, joint_5)
         piper.GripperCtrl(abs(joint_6), 1000, 0x01, 0)
-        print(piper.GetArmStatus())
-        print(position)
+        # print(piper.GetArmStatus())
+        # print(position)
         time.sleep(0.005)
     

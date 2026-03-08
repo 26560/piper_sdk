@@ -7,7 +7,7 @@ import time
 from piper_sdk import *
 
 if __name__ == "__main__":
-    piper = C_PiperInterface_V2("can0")
+    piper = C_PiperInterface_V2("pipercan0", False)
     piper.ConnectPort()
     piper.ArmParamEnquiryAndConfig(0x01,0x02,0,0,0x02)
     while True:

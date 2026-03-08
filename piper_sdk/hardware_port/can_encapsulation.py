@@ -43,7 +43,7 @@ class C_STD_CAN():
         callback_function: The callback function in ReadCanMessage, which should be passed as a function.
     '''
     def __init__(self, 
-                 channel_name:str="can0", 
+                 channel_name:str="pipercan0", 
                  bustype="socketcan", 
                  expected_bitrate:int=1000000,
                  judge_flag:bool=True, 
@@ -269,10 +269,10 @@ class C_STD_CAN():
 ## 示例代码
 # if __name__ == "__main__":
 #     try:
-#         can_obj = C_STD_CAN(channel_name="can0")
+#         can_obj = C_STD_CAN(channel_name="pipercan0")
 #         print("CAN bus initialized successfully.")
 #         print(can_obj.get_can_ports())
-#         print(can_obj.can_port_info("can0"))
+#         print(can_obj.can_port_info("pipercan0"))
 #         print(can_obj.ReadCanMessage())
 #         print(can_obj.GetRxMessage())
 #     except ValueError as e:

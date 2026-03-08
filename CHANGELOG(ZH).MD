@@ -259,7 +259,7 @@ Version 0.3.0
 - 在`C_STD_CAN` 类中初始化`rx_message`为`Message()`类型
 - 修改了获取反馈信息时间戳的位置，从interface中获取当前系统时间修改到进入解码函数中获取时间戳，以增加数据时间戳的精准性
 - 添加了 `piper_param_manager` 文件，其中包含角度和夹持器范围限制，并对反馈和控制消息应用约束
-  - 使用interface中的形参来打开sdk限制功能：`piper = C_PiperInterface_V2("can0", start_sdk_joint_limit=True, start_sdk_gripper_limit=True)`
+  - 使用interface中的形参来打开sdk限制功能：`piper = C_PiperInterface_V2("pipercan0", start_sdk_joint_limit=True, start_sdk_gripper_limit=True)`
   - 如果反馈或控制消息超出设定的限制，则值将被限制在边界值内
   - 程序内已经存在了默认限制，要自定义配置限制范围，请使用 `SetSDKJointLimitParam` 和 `SetSDKGripperRangeParam` 函数设置软件约束
   
@@ -473,7 +473,7 @@ Version 0.1.12
 
 ##### 2.1 特性
 
-- 增加了类的条件实例化特性，条件为传入interface的`can_name`，如在循环中重复`piper=C_PiperInterface(can_name="can0")`，仅仅只会创建一次实例，之后的实例化会因为识别到已经重复创建了`can_name="can0"`实例而不会重复创建
+- 增加了类的条件实例化特性，条件为传入interface的`can_name`，如在循环中重复`piper=C_PiperInterface(can_name="pipercan0")`，仅仅只会创建一次实例，之后的实例化会因为识别到已经重复创建了`can_name="pipercan0"`实例而不会重复创建
 - 类内增加了帧率计算，可以通过下面的`isOk`函数判断can传输是否正常，反馈值为True则表明数据正常传输，如果为False则说明数据断开
 - 增加了正解，通过扩展DH参数来计算每个关节相对base_link的位姿，通过`GetFK`函数获取，反馈link1~link6的位姿，是一个6*6的列表，第-1位为link6的位姿
 

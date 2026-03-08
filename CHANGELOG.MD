@@ -263,7 +263,7 @@ Features
 - Initialized `rx_message` to `Message()` type in the `C_STD_CAN` class
 - Modified the location of obtaining the timestamp of the feedback information, from obtaining the current system time from the interface to obtaining the timestamp in the decoding function to increase the accuracy of the data timestamp
 - Added the `piper_param_manager` file, which contains the angle and gripper range limits and applies constraints to feedback and control messages
-  - Use the parameters in the interface to turn on the sdk limit function: `piper = C_PiperInterface_V2("can0", start_sdk_joint_limit=True, start_sdk_gripper_limit=True)`
+  - Use the parameters in the interface to turn on the sdk limit function: `piper = C_PiperInterface_V2("pipercan0", start_sdk_joint_limit=True, start_sdk_gripper_limit=True)`
   - If the feedback or control message exceeds the set limit, the value will be clamped within the boundary value
   - Default limits already exist in the program. To customize the configuration limit range, use the `SetSDKJointLimitParam` and `SetSDKGripperRangeParam` functions to set software constraints
 
@@ -483,7 +483,7 @@ The following sections mainly explain the differences between the 0.1.x-V1 versi
 
 ##### 1.2.1 Interface Features
 
-- Added conditional instantiation for the class. The condition is the `can_name` passed to the interface. For example, in a loop, repeatedly calling `piper = C_PiperInterface(can_name="can0")` will only create one instance. Subsequent instantiations will recognize that an instance with `can_name="can0"` has already been created and will not create a new one.
+- Added conditional instantiation for the class. The condition is the `can_name` passed to the interface. For example, in a loop, repeatedly calling `piper = C_PiperInterface(can_name="pipercan0")` will only create one instance. Subsequent instantiations will recognize that an instance with `can_name="pipercan0"` has already been created and will not create a new one.
 - The class now includes frame rate calculation. You can use the `isOk` function to check if CAN data transmission is normal. A True feedback indicates normal data transmission, while False indicates that the data has been disconnected.
 - Added forward kinematics (FK) calculation. The pose of each joint relative to the base_link is calculated by extending the DH parameters. This can be obtained through the `GetFK` function, which returns the pose of link1 to link6 in a 6*6 list. The last element represents the pose of link6.
 

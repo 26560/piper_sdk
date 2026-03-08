@@ -299,7 +299,7 @@ if __name__ == "__main__":
     #               LogLevel.SILENT
     # log_to_file(bool -> default False):是否打开log写入文件功能，True则打开，默认关闭
     # log_file_path(str -> default False):设定log写入文件的路径，默认在sdk路径下的log文件夹
-    piper = C_PiperInterface(can_name="can0",
+    piper = C_PiperInterface(can_name="pipercan0",
                             judge_flag=False,
                             can_auto_init=True,
                             dh_is_offset=1,
@@ -334,7 +334,7 @@ if __name__ == "__main__":
 import time
 from piper_sdk import *
 if __name__ == "__main__":
-    piper = C_PiperInterface("can0")
+    piper = C_PiperInterface("pipercan0")
     piper.ConnectPort()
     time.sleep(0.03) # 需要时间去读取固件反馈帧，否则会反馈-0x4AF
     print(piper.GetPiperFirmwareVersion())
@@ -348,7 +348,7 @@ if __name__ == "__main__":
 - 需要先激活can设备，并且设置正确的波特率，才可以读取机械臂消息或者控制机械臂
 - C_PiperInterface 接口类在实例化时可传入激活的can路由名称，这个名称可以通过`ifconfig`得到
 - 执行can发送，终端反馈`SendCanMessage(SEND_MESSAGE_FAILED (100017))`，是can模块没有成功连接设备，先检查模块与机械臂的连接状态，然后将机械臂断电后上电，再尝试发送
-- sdk的interface在创建实例后会检测是否激活自带的can模块，如果是其它can设备，可以将第二个形参设定为False，如：`piper = C_PiperInterface_V2("can0",False)`
+- sdk的interface在创建实例后会检测是否激活自带的can模块，如果是其它can设备，可以将第二个形参设定为False，如：`piper = C_PiperInterface_V2("pipercan0",False)`
 - **机械臂的mit协议控制单关节电机为高级功能,使用时需注意,此协议的使用不当会导致机械臂损坏！！！**
 
 ## 联系我们

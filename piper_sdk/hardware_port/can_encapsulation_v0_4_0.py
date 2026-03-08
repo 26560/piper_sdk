@@ -80,7 +80,7 @@ class C_STD_CAN():
             return f"{self.name}: {self.value}"
     
     def __init__(self, 
-                 channel_name:str="can0", 
+                 channel_name:str="pipercan0", 
                  bustype="socketcan", 
                  expected_bitrate:int=1000000,
                  judge_flag:bool=True, 
@@ -321,7 +321,7 @@ class C_STD_CAN():
 
 ## 示例代码
 # if __name__ == "__main__":
-#     can_name = "can0"
+#     can_name = "pipercan0"
 #     try:
 #         can_obj = C_STD_CAN(channel_name=can_name)
 #         print("CAN bus initialized successfully.")

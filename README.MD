@@ -308,7 +308,7 @@ if __name__ == "__main__":
     #               LogLevel.SILENT
     #   log_to_file(bool -> default False): Whether to enable the log writing function, True to enable, default to disable
     #   log_file_path(str -> default False): Set the path to write the log file, the default is the log folder under the sdk path
-    piper = C_PiperInterface(can_name="can0",
+    piper = C_PiperInterface(can_name="pipercan0",
                                 judge_flag=False,
                                 can_auto_init=True,
                                 dh_is_offset=1,
@@ -344,7 +344,7 @@ import time
 from piper_sdk import *
 
 if __name__ == "__main__":
-    piper = C_PiperInterface("can0")
+    piper = C_PiperInterface("pipercan0")
     piper.ConnectPort()
     time.sleep(0.025) # It takes time to read the firmware feedback frame, otherwise -0x4AF will be fed back
     print(piper.GetPiperFirmwareVersion())
@@ -358,7 +358,7 @@ if __name__ == "__main__":
 - Ensure that CAN devices are activated and set to the correct baud rate before reading robot arm messages or controlling the robot arm.
 - The `C_PiperInterface` class can accept the activated CAN interface name during instantiation, which can be obtained from `ifconfig`.
 - If a message is not sent with the feedback `SendCanMessage(SEND_MESSAGE_FAILED (100017))` the CAN module might not be successfully connected. Check the connection and power cycle the robot arm before retrying.
-- The SDK's interface will check if the built-in CAN module is activated after creating the instance. For other CAN devices, set the second parameter to False, for example: `piper = C_PiperInterface_V2("can0", False)`.
+- The SDK's interface will check if the built-in CAN module is activated after creating the instance. For other CAN devices, set the second parameter to False, for example: `piper = C_PiperInterface_V2("pipercan0", False)`.
 - **The MIT protocol for controlling individual joints is an advanced feature; misuse of this protocol can damage the robot arm!**
 
 ## Contact Us

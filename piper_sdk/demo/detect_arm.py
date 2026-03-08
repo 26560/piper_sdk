@@ -16,7 +16,7 @@ except ImportError:
     import msvcrt
 
 parser = argparse.ArgumentParser(description="Piper Terminal Table Monitor")
-parser.add_argument("--can_port", type=str, default="can0", help="CAN port name")
+parser.add_argument("--can_port", type=str, default="pipercan0", help="CAN port name")
 parser.add_argument("--hz", type=float, default=10, help="Refresh rate (Hz), range: 0.5 ~ 200")
 parser.add_argument("--req_flag", type=int, default=1, help=", 0 or 1")
 args = parser.parse_args()

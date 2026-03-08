@@ -4,7 +4,7 @@
 from piper_sdk import *
 
 if __name__ == "__main__":
-    piper = C_PiperInterface_V2("can0",
+    piper = C_PiperInterface_V2("pipercan0", False,
                                 start_sdk_gripper_limit=True,
                                 start_sdk_joint_limit=True
                                 )

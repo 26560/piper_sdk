@@ -7,7 +7,7 @@ from piper_sdk import *
 
 # 测试代码
 if __name__ == "__main__":
-    piper = C_PiperInterface_V2()
+    piper = C_PiperInterface_V2("pipercan0", False)
     piper.ConnectPort()
     while True:
         piper.MotionCtrl_2(1, 1, 0, 0xAD)# 0xFC
