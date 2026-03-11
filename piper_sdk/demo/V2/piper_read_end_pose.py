@@ -10,5 +10,6 @@ if __name__ == "__main__":
     piper.ConnectPort()
     while True:
         print(piper.GetArmEndPoseMsgs())
-        time.sleep(0.01)
+        # time.sleep(0.1)
+        input()
     

@@ -27,16 +27,24 @@ DEPTH_SCALE_TO_M = 0.0001
 # 目标点上方悬停高度，防止碰桌
 HOVER_Z_OFFSET_M = 0.08
 
-# # 持续发送时间
+# 持续发送时间
 # SEND_SECONDS = 5.0
 # DT = 0.01
 # SPEED_PERCENT = 100
 
 # =========================
-# D405 -> 夹爪中心(ee) 的固定变换
+# 法兰盘 -> TCP(夹爪中心) 的固定变换
+# 由“同一点多姿态触碰”数据反解得到的初值
+# =========================
+T_FLANGE_TCP = np.eye(4, dtype=np.float64)
+T_FLANGE_TCP[:3, 3] = np.array([0.0013, 0.0007, 0.1914], dtype=np.float64)
+
+# =========================
+# 相机 -> TCP 的固定变换
+# 当前先沿用你原脚本里的几何初值
 # 如果悬停方向不对，只需要改这个矩阵
 # =========================
-T_EE_CAM = np.array([
+T_TCP_CAM = np.array([
     [0.0,  0.0,  1.0, -0.132],
     [-1.0, 0.0,  0.0,  0.000],
     [0.0, -1.0,  0.0,  0.046],
@@ -109,6 +117,8 @@ def robust_depth_at(depth_img, u, v, radius=3):
 
     patch = depth_img[y1:y2, x1:x2]
     valid = patch[patch > 0]
+    if valid.size == 0:
+        raise ValueError(f"No valid depth around pixel ({u:.2f}, {v:.2f})")
     return float(np.median(valid))
 
 
@@ -148,6 +158,20 @@ def pose_to_command_units(xyz_m, rpy_deg):
     return X, Y, Z, RX, RY, RZ
 
 
+def flange_to_tcp_xyz(flange_xyz_m, flange_rpy_deg):
+    R_base_flange = rpy_deg_to_matrix(
+        flange_rpy_deg[0], flange_rpy_deg[1], flange_rpy_deg[2]
+    )
+    return flange_xyz_m + R_base_flange @ T_FLANGE_TCP[:3, 3]
+
+
+def tcp_target_to_flange_cmd(target_tcp_xyz_m, cmd_rpy_deg):
+    R_base_flange = rpy_deg_to_matrix(
+        cmd_rpy_deg[0], cmd_rpy_deg[1], cmd_rpy_deg[2]
+    )
+    return target_tcp_xyz_m - R_base_flange @ T_FLANGE_TCP[:3, 3]
+
+
 # =========================
 # 主流程
 # =========================
@@ -177,49 +201,53 @@ if __name__ == "__main__":
     piper = C_PiperInterface_V2(CAN_NAME, False)
     piper.ConnectPort()
     while not piper.EnablePiper():
-        time.sleep(1)
+        time.sleep(0.01)
 
-    # 5) 读取当前末端位姿
-    cur_xyz_m, cur_rpy_deg = current_pose_from_piper(piper)
+    # 5) 读取当前法兰盘位姿（SDK 反馈的是法兰盘，不是夹爪中心 TCP）
+    cur_flange_xyz_m, cur_flange_rpy_deg = current_pose_from_piper(piper)
 
-    # 6) 构建 T_base_ee
-    R_base_ee = rpy_deg_to_matrix(cur_rpy_deg[0], cur_rpy_deg[1], cur_rpy_deg[2])
-    T_base_ee = make_transform(R_base_ee, cur_xyz_m)
+    # 6) 构建 T_base_flange
+    R_base_flange = rpy_deg_to_matrix(
+        cur_flange_rpy_deg[0], cur_flange_rpy_deg[1], cur_flange_rpy_deg[2]
+    )
+    T_base_flange = make_transform(R_base_flange, cur_flange_xyz_m)
 
-    # 7) 链式求解：base <- ee <- cam
-    T_base_cam = T_base_ee @ T_EE_CAM
-    target_xyz_m = transform_point(T_base_cam, p_cam)
+    # 7) 链式求解：base <- flange <- tcp <- cam
+    T_base_cam = T_base_flange @ T_FLANGE_TCP @ T_TCP_CAM
+    target_tcp_xyz_m = transform_point(T_base_cam, p_cam)
 
-    # 8) 在目标点上方悬停
-    hover_xyz_m = target_xyz_m.copy()
-    hover_xyz_m[2] += HOVER_Z_OFFSET_M
+    # 8) 在目标 TCP 点上方悬停
+    hover_tcp_xyz_m = target_tcp_xyz_m.copy()
+    hover_tcp_xyz_m[2] += HOVER_Z_OFFSET_M
 
-    # 9) 姿态保持当前值不变
-    keep_rpy_deg = cur_rpy_deg.copy()
+    # 9) 姿态保持当前法兰盘姿态不变
+    keep_rpy_deg = cur_flange_rpy_deg.copy()
 
-    # 10) 打印结果
+    # 10) 目标 TCP -> 法兰盘控制点
+    cur_tcp_xyz_m = flange_to_tcp_xyz(cur_flange_xyz_m, cur_flange_rpy_deg)
+    hover_flange_xyz_m = tcp_target_to_flange_cmd(hover_tcp_xyz_m, keep_rpy_deg)
+
+    # 11) 打印结果
     print("=" * 80)
     print("[INFO] infer_result:")
     print(json.dumps(infer, indent=2, ensure_ascii=False))
     print("[INFO] camera point (m):", p_cam.tolist())
     print("[INFO] u_img, v_img:", u_img, v_img)
     print("[INFO] depth_raw:", z_raw, " depth_m:", z_raw * DEPTH_SCALE_TO_M)
-    print("[INFO] current end pose xyz(m):", cur_xyz_m.tolist())
-    print("[INFO] current end pose rpy(deg):", keep_rpy_deg.tolist())
-    print("[INFO] target point in base (m):", target_xyz_m.tolist())
-    print("[INFO] hover point in base (m):", hover_xyz_m.tolist())
+    print("[INFO] current flange pose xyz(m):", cur_flange_xyz_m.tolist())
+    print("[INFO] current flange pose rpy(deg):", keep_rpy_deg.tolist())
+    print("[INFO] current tcp xyz(m):", cur_tcp_xyz_m.tolist())
+    print("[INFO] target tcp point in base (m):", target_tcp_xyz_m.tolist())
+    print("[INFO] hover tcp point in base (m):", hover_tcp_xyz_m.tolist())
+    print("[INFO] hover flange cmd xyz(m):", hover_flange_xyz_m.tolist())
     print("=" * 80)
 
-    # 11) 转成控制命令单位
-    X, Y, Z, RX, RY, RZ = pose_to_command_units(hover_xyz_m, keep_rpy_deg)
-    RX = -162606
-    RY = 20572
-    RZ = -48808
-    
+    # 12) 转成控制命令单位（不再强行覆盖 RX/RY/RZ）
+    X, Y, Z, RX, RY, RZ = pose_to_command_units(hover_flange_xyz_m, keep_rpy_deg)
 
-    # 12) 按官方 demo 风格持续发送 hover 位姿
-    print(X, Y, Z, RX, RY, RZ, sep=',',)
-    # piper.MotionCtrl_2(0x01, 0x00, SPEED_PERCENT, 0x00)
-    # piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
+    # 13) 按官方 demo 风格持续发送 hover 位姿
+    print(X, Y, Z, RX, RY, RZ, sep=',')
+    piper.MotionCtrl_2(0x01, 0x00, 10, 0x00)
+    piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
 
     print("[DONE] hover command finished")
