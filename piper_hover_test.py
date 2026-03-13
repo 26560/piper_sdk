@@ -5,15 +5,15 @@ import time
 import json
 import math
 import numpy as np
+import socket
+import uuid
 from piper_sdk import *
 
-# =========================
-# 配置
-# =========================
 CAN_NAME = "pipercan0"
 
 INFER_JSON = "/home/swfu/ws/piper_ggcnn/ggcnn/captures/infer_result.json"
 DEPTH_NPY = "/home/swfu/ws/piper_ggcnn/ggcnn/captures/depth_0000.npy"
+CAPTURE_POSE_JSON = "/home/swfu/ws/piper_ggcnn/ggcnn/captures/pose_0000.json"
 
 # D405 内参
 FX = 653.9111
@@ -21,16 +21,12 @@ FY = 653.9111
 PPX = 645.5704
 PPY = 363.8945
 
-# 你的 depth_0000.npy 实测对应 1834 -> 0.1834 m，所以这里用 0.0001
 DEPTH_SCALE_TO_M = 0.0001
 
 # 目标点上方悬停高度，防止碰桌
-HOVER_Z_OFFSET_M = 0.08
+HOVER_Z_OFFSET_M = 0.04
 
-# 持续发送时间
-# SEND_SECONDS = 5.0
-# DT = 0.01
-# SPEED_PERCENT = 100
+GRIPPER_SOCKET = "/tmp/pika_gripper.sock"
 
 # =========================
 # 法兰盘 -> TCP(夹爪中心) 的固定变换
@@ -39,18 +35,19 @@ HOVER_Z_OFFSET_M = 0.08
 T_FLANGE_TCP = np.eye(4, dtype=np.float64)
 T_FLANGE_TCP[:3, 3] = np.array([0.0013, 0.0007, 0.1914], dtype=np.float64)
 
-# =========================
-# 相机 -> TCP 的固定变换
-# 当前先沿用你原脚本里的几何初值
-# 如果悬停方向不对，只需要改这个矩阵
-# =========================
-T_TCP_CAM = np.array([
-    [0.0,  0.0,  1.0, -0.132],
-    [-1.0, 0.0,  0.0,  0.000],
-    [0.0, -1.0,  0.0,  0.046],
-    [0.0,  0.0,  0.0,  1.000],
-], dtype=np.float64)
+HAND_EYE_JSON = "/home/swfu/ws/handeye_out/handeye_best.json"
 
+with open(HAND_EYE_JSON, "r", encoding="utf-8") as f:
+    handeye = json.load(f)
+
+# handeye_best.json 里这个矩阵就是：法兰 <- 相机
+T_FLANGE_CAM = np.array(handeye["T_cam2gripper"], dtype=np.float64)
+
+# 脚本真正需要的是：TCP <- 相机
+T_TCP_CAM = np.linalg.inv(T_FLANGE_TCP) @ T_FLANGE_CAM
+
+print("[INFO] T_FLANGE_CAM =\n", T_FLANGE_CAM)
+print("[INFO] T_TCP_CAM =\n", T_TCP_CAM)
 
 # =========================
 # 工具函数
@@ -98,8 +95,8 @@ def transform_point(T, p):
     return out[:3]
 
 
-def map_300_to_fullres(u_300, v_300, crop_x0, crop_y0, crop_side):
-    scale = crop_side / 300.0
+def map_input_to_fullres(u_300, v_300, crop_x0, crop_y0, crop_side, input_side=300):
+    scale = crop_side / float(input_side)
     u_img = crop_x0 + (u_300 + 0.5) * scale
     v_img = crop_y0 + (v_300 + 0.5) * scale
     return u_img, v_img
@@ -116,7 +113,7 @@ def robust_depth_at(depth_img, u, v, radius=3):
     y2 = min(h, vi + radius + 1)
 
     patch = depth_img[y1:y2, x1:x2]
-    valid = patch[patch > 0]
+    valid = patch[(patch > 0) & (patch < 65000)]
     if valid.size == 0:
         raise ValueError(f"No valid depth around pixel ({u:.2f}, {v:.2f})")
     return float(np.median(valid))
@@ -132,8 +129,6 @@ def pixel_to_camera_xyz(u, v, z_raw):
 def current_pose_from_piper(piper):
     msg = piper.GetArmEndPoseMsgs().end_pose
 
-    # SDK demo里 EndPoseCtrl 输入是 mm*1000 / deg*1000
-    # 所以反馈这里对应反解：
     x_m = msg.X_axis / 1000000.0
     y_m = msg.Y_axis / 1000000.0
     z_m = msg.Z_axis / 1000000.0
@@ -144,6 +139,35 @@ def current_pose_from_piper(piper):
 
     xyz_m = np.array([x_m, y_m, z_m], dtype=np.float64)
     rpy_deg = np.array([rx_deg, ry_deg, rz_deg], dtype=np.float64)
+    return xyz_m, rpy_deg
+
+
+def pose_json_to_xyz_rpy_deg(pose):
+    xyz_m = np.array(
+        [pose["x_m"], pose["y_m"], pose["z_m"]],
+        dtype=np.float64,
+    )
+
+    raw = pose.get("raw", {})
+    if {"rx", "ry", "rz"} <= raw.keys():
+        rpy_deg = np.array(
+            [
+                raw["rx"] / 1000.0,
+                raw["ry"] / 1000.0,
+                raw["rz"] / 1000.0,
+            ],
+            dtype=np.float64,
+        )
+    else:
+        rpy_deg = np.array(
+            [
+                math.degrees(pose["rx_rad"]),
+                math.degrees(pose["ry_rad"]),
+                math.degrees(pose["rz_rad"]),
+            ],
+            dtype=np.float64,
+        )
+
     return xyz_m, rpy_deg
 
 
@@ -171,6 +195,37 @@ def tcp_target_to_flange_cmd(target_tcp_xyz_m, cmd_rpy_deg):
     )
     return target_tcp_xyz_m - R_base_flange @ T_FLANGE_TCP[:3, 3]
 
+def gripper_call(cmd: str, sock_timeout: float = 5.0, **kwargs):
+    req = {
+        "id": str(uuid.uuid4()),
+        "cmd": cmd,
+        **kwargs,
+    }
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(sock_timeout)
+        s.connect(GRIPPER_SOCKET)
+
+        msg = json.dumps(req, ensure_ascii=False) + "\n"
+        s.sendall(msg.encode("utf-8"))
+
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+
+    if not buf:
+        raise RuntimeError("empty response from gripper server")
+
+    resp = json.loads(buf.decode("utf-8").strip())
+
+    if not resp.get("ok", False):
+        raise RuntimeError(f"gripper error: {resp.get('code')} {resp.get('error')}")
+
+    return resp
+
 
 # =========================
 # 主流程
@@ -181,16 +236,19 @@ if __name__ == "__main__":
         infer = json.load(f)
 
     depth = np.load(DEPTH_NPY).astype(np.float32)
+    with open(CAPTURE_POSE_JSON, "r", encoding="utf-8") as f:
+        capture_pose = json.load(f)
 
     u_300 = infer["u_300"]
     v_300 = infer["v_300"]
+    input_side = infer.get("input_side", 300)
     crop_x0 = infer["crop_x0"]
     crop_y0 = infer["crop_y0"]
     crop_side = infer["crop_side"]
 
-    # 2) 300x300 抓取点 -> 原图像素
-    u_img, v_img = map_300_to_fullres(
-        u_300, v_300, crop_x0, crop_y0, crop_side
+    # 2) 输入网格抓取点 -> 原图像素
+    u_img, v_img = map_input_to_fullres(
+        u_300, v_300, crop_x0, crop_y0, crop_side, input_side=input_side
     )
 
     # 3) 取深度并反投影到相机坐标系
@@ -203,14 +261,17 @@ if __name__ == "__main__":
     while not piper.EnablePiper():
         time.sleep(0.01)
 
-    # 5) 读取当前法兰盘位姿（SDK 反馈的是法兰盘，不是夹爪中心 TCP）
+    # 5) 读取拍照时保存的法兰盘位姿，用它复现拍照时的 base <- flange
+    cap_flange_xyz_m, cap_flange_rpy_deg = pose_json_to_xyz_rpy_deg(capture_pose)
+
+    # 当前位姿只用于打印调试，不参与目标点解算
     cur_flange_xyz_m, cur_flange_rpy_deg = current_pose_from_piper(piper)
 
     # 6) 构建 T_base_flange
     R_base_flange = rpy_deg_to_matrix(
-        cur_flange_rpy_deg[0], cur_flange_rpy_deg[1], cur_flange_rpy_deg[2]
+        cap_flange_rpy_deg[0], cap_flange_rpy_deg[1], cap_flange_rpy_deg[2]
     )
-    T_base_flange = make_transform(R_base_flange, cur_flange_xyz_m)
+    T_base_flange = make_transform(R_base_flange, cap_flange_xyz_m)
 
     # 7) 链式求解：base <- flange <- tcp <- cam
     T_base_cam = T_base_flange @ T_FLANGE_TCP @ T_TCP_CAM
@@ -220,8 +281,8 @@ if __name__ == "__main__":
     hover_tcp_xyz_m = target_tcp_xyz_m.copy()
     hover_tcp_xyz_m[2] += HOVER_Z_OFFSET_M
 
-    # 9) 姿态保持当前法兰盘姿态不变
-    keep_rpy_deg = cur_flange_rpy_deg.copy()
+    # 9) 姿态保持拍照时法兰盘姿态，避免重复运行时再次受当前姿态影响
+    keep_rpy_deg = cap_flange_rpy_deg.copy()
 
     # 10) 目标 TCP -> 法兰盘控制点
     cur_tcp_xyz_m = flange_to_tcp_xyz(cur_flange_xyz_m, cur_flange_rpy_deg)
@@ -231,11 +292,16 @@ if __name__ == "__main__":
     print("=" * 80)
     print("[INFO] infer_result:")
     print(json.dumps(infer, indent=2, ensure_ascii=False))
+    print("[INFO] capture pose file:", CAPTURE_POSE_JSON)
+    print("[INFO] capture pose request_timestamp:", capture_pose.get("request_timestamp"))
+    print("[INFO] capture pose worker_capture_timestamp:", capture_pose.get("worker_capture_timestamp"))
     print("[INFO] camera point (m):", p_cam.tolist())
     print("[INFO] u_img, v_img:", u_img, v_img)
     print("[INFO] depth_raw:", z_raw, " depth_m:", z_raw * DEPTH_SCALE_TO_M)
+    print("[INFO] captured flange pose xyz(m):", cap_flange_xyz_m.tolist())
+    print("[INFO] captured flange pose rpy(deg):", cap_flange_rpy_deg.tolist())
     print("[INFO] current flange pose xyz(m):", cur_flange_xyz_m.tolist())
-    print("[INFO] current flange pose rpy(deg):", keep_rpy_deg.tolist())
+    print("[INFO] current flange pose rpy(deg):", cur_flange_rpy_deg.tolist())
     print("[INFO] current tcp xyz(m):", cur_tcp_xyz_m.tolist())
     print("[INFO] target tcp point in base (m):", target_tcp_xyz_m.tolist())
     print("[INFO] hover tcp point in base (m):", hover_tcp_xyz_m.tolist())
@@ -247,7 +313,20 @@ if __name__ == "__main__":
 
     # 13) 按官方 demo 风格持续发送 hover 位姿
     print(X, Y, Z, RX, RY, RZ, sep=',')
-    piper.MotionCtrl_2(0x01, 0x00, 10, 0x00)
+    piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
     piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
+    # TODO：这里读状态经常会返回到达失败，干脆延迟一定时间后再控制夹爪了
+    
+    # status = piper.GetArmStatus()
+    # while (not status.arm_status.motion_status):
+    #     time.sleep(0.3)
+    # print(status, "\n\n")
+    # print(status.arm_status.motion_status)
+    time.sleep(3)
+    print(gripper_call("close"))
+    print(gripper_call("status"))
+    time.sleep(3)
+    print(gripper_call("open"))
+    print(gripper_call("status"))
 
     print("[DONE] hover command finished")
