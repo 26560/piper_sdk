@@ -9,11 +9,19 @@ from piper_sdk import *
 if __name__ == "__main__":
     piper = C_PiperInterface_V2("pipercan0", False)
     piper.ConnectPort()
-    # while(piper.DisablePiper()):
-    #     time.sleep(0.01)
-    for i in range(1,7):
-        print(i)
-        time.sleep(3)
-        piper.DisableArm(i)
+    piper.DisableArm(1)
+
+    print("2")
+    time.sleep(2)
+    piper.DisableArm(2)
+
+    print("3")
+    time.sleep(2)
+    piper.DisableArm(3)
+
+    piper.DisableArm(4)
+    piper.DisableArm(5)
+    piper.DisableArm(6)
+
     print("失能成功!!!!")
     

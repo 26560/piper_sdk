@@ -19,7 +19,7 @@ if __name__ == "__main__":
     joint_4 = round(position[4]*factor)
     joint_5 = round(position[5]*factor)
     joint_6 = round(position[6]*1000*1000)
-    piper.ModeCtrl(0x01, 0x01, 30, 0x00)
+    piper.ModeCtrl(0x01, 0x01, 10, 0x00)
     piper.JointCtrl(joint_0, joint_1, joint_2, joint_3, joint_4, joint_5)
     piper.GripperCtrl(abs(joint_6), 1000, 0x01, 0)
     
