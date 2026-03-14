@@ -11,6 +11,7 @@ import traceback
 import uuid
 from pathlib import Path
 
+import cv2
 import numpy as np
 from piper_sdk import *
 
@@ -18,10 +19,12 @@ from piper_sdk import *
 SOCKET_PATH = "/tmp/piper_hover.sock"
 CAN_NAME = "pipercan0"
 GRIPPER_SOCKET = "/tmp/pika_gripper.sock"
+PHOTO_SOCKET = "/tmp/piper_take_photo.sock"
 
 INFER_JSON = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/infer_result.json")
 DEPTH_NPY = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/depth_0000.npy")
 CAPTURE_POSE_JSON = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/pose_0000.json")
+RELEASE_DEBUG_PNG = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/release_depth_debug.png")
 HAND_EYE_JSON = Path("/home/swfu/ws/handeye_out/handeye_best.json")
 FIXED_CAMERA_INFO_JSON = Path(
     os.environ.get(
@@ -31,23 +34,36 @@ FIXED_CAMERA_INFO_JSON = Path(
 ).expanduser()
 
 DEPTH_SCALE_TO_M = 0.0001
-HOVER_Z_OFFSET_M = -0.015
+HOVER_Z_OFFSET_M = -0.025
 
-APPROACH_WAIT_SEC = 2.0
+APPROACH_WAIT_SEC = 1.5
 CLOSE_WAIT_SEC = 0.5
 RELEASE_WAIT_SEC = 2.0
 
-DEFAULT_RELEASE_JOINTS = [30000, 79447, -53706, 0, 51581, 0]
-LEVEL_RELEASE_JOINTS = {
-    "default": DEFAULT_RELEASE_JOINTS,
-    "1": [30000, 79447, -53706, 0, 51581, -30000],
-    "2": [30000, 79447, -53706, 0, 51581, 0],
-    "3": [30000, 79447, -53706, 0, 51581, 30000],
-    "4": [30000, 79447, -53706, 0, 51581, 0],
+Z_PROTECT = 175000
+RELEASE_Z_CLEARANCE_M = 0.03
+RELEASE_DEPTH_EPSILON_RAW = 80.0
+RELEASE_IQR_MARGIN_RAW = 200.0
+RELEASE_SURFACE_PERCENTILE = 10.0
+
+DEFAULT_PRE_RELEASE_POSE_CMD = [221813, 128064, 252747, 180000, 17678, -150000]
+LEVEL_PRE_RELEASE_POSE_CMD = {
+    "default": DEFAULT_PRE_RELEASE_POSE_CMD,
+    "1": [-48436, 274696, 301972, 180000, 27678, -80000],
+    "2": [262112, 95401, 301972, 180000, 27678, -160000],
+    "3": [274696, 48436, 301972, 180000, 27678, -170000],
+    "4": [278933, 0, 301972, 180000, 27678, 180000],
+}
+LEVEL_RELEASE_ROI = {
+    "default": (512, 245, 768, 418),
+    "1": (102, 245, 410, 418),
+    "2": (333, 245, 640, 418),
+    "3": (640, 245, 947, 418),
+    "4": (870, 245, 1178, 418),
 }
 
 T_FLANGE_TCP = np.eye(4, dtype=np.float64)
-T_FLANGE_TCP[:3, 3] = np.array([0.0013, 0.0007, 0.1914], dtype=np.float64)
+T_FLANGE_TCP[:3, 3] = np.array([0.0019368, 0.0011535, 0.1921555], dtype=np.float64)
 
 with open(HAND_EYE_JSON, "r", encoding="utf-8") as file_obj:
     HANDEYE = json.load(file_obj)
@@ -206,16 +222,124 @@ def tcp_target_to_flange_cmd(target_tcp_xyz_m, cmd_rpy_deg):
     return target_tcp_xyz_m - rotation @ T_FLANGE_TCP[:3, 3]
 
 
-def resolve_release_joints(level, override=None):
-    if override is not None:
-        if not isinstance(override, (list, tuple)) or len(override) != 6:
+def joint_cmd_to_pose_cmd(joint_cmd):
+    fk_solver = C_PiperForwardKinematics()
+    joint_rad = [math.radians(value / 1000.0) for value in joint_cmd]
+    pose_mm_deg = fk_solver.CalFK(joint_rad)[-1]
+    xyz_m = np.array(pose_mm_deg[:3], dtype=np.float64) / 1000.0
+    rpy_deg = np.array(pose_mm_deg[3:], dtype=np.float64)
+    return list(pose_to_command_units(xyz_m, rpy_deg))
+
+
+def resolve_pre_release_pose_cmd(level, pose_override=None, joint_override=None):
+    if pose_override is not None:
+        if not isinstance(pose_override, (list, tuple)) or len(pose_override) != 6:
+            raise ValueError("pre_release_pose_cmd must contain 6 values")
+        return [int(value) for value in pose_override]
+
+    if joint_override is not None:
+        if not isinstance(joint_override, (list, tuple)) or len(joint_override) != 6:
             raise ValueError("release_joint_cmd must contain 6 values")
-        return [int(value) for value in override]
+        return joint_cmd_to_pose_cmd([int(value) for value in joint_override])
 
     level_key = str(level).strip().upper()
-    if level_key in LEVEL_RELEASE_JOINTS:
-        return list(LEVEL_RELEASE_JOINTS[level_key])
-    return list(LEVEL_RELEASE_JOINTS["default"])
+    if level_key in LEVEL_PRE_RELEASE_POSE_CMD:
+        return list(LEVEL_PRE_RELEASE_POSE_CMD[level_key])
+    return list(LEVEL_PRE_RELEASE_POSE_CMD["default"])
+
+
+def resolve_release_roi(level, image_shape):
+    h, w = image_shape[:2]
+    level_key = str(level).strip().upper()
+    x0_px, y0_px, x1_px, y1_px = LEVEL_RELEASE_ROI.get(
+        level_key, LEVEL_RELEASE_ROI["default"]
+    )
+    x0 = max(0, min(w - 1, int(x0_px)))
+    y0 = max(0, min(h - 1, int(y0_px)))
+    x1 = max(x0 + 1, min(w, int(x1_px)))
+    y1 = max(y0 + 1, min(h, int(y1_px)))
+    return x0, y0, x1, y1
+
+
+def filtered_surface_depth_in_roi(depth_img, roi, valid_max=65000):
+    x0, y0, x1, y1 = roi
+    patch = depth_img[y0:y1, x0:x1]
+    valid_mask = (patch > 0) & (patch < valid_max)
+    valid = patch[valid_mask].astype(np.float32)
+    if valid.size == 0:
+        raise ValueError(f"No valid depth in release ROI {roi}")
+
+    q1 = float(np.percentile(valid, 25))
+    q3 = float(np.percentile(valid, 75))
+    iqr = max(q3 - q1, 1.0)
+    lo = max(1.0, q1 - 1.5 * iqr)
+    hi = min(float(valid_max - 1), q3 + 1.5 * iqr + RELEASE_IQR_MARGIN_RAW)
+
+    filtered_mask = valid_mask & (patch >= lo) & (patch <= hi)
+    filtered = patch[filtered_mask].astype(np.float32)
+    if filtered.size == 0:
+        filtered_mask = valid_mask
+        filtered = valid
+
+    z_raw = float(np.percentile(filtered, RELEASE_SURFACE_PERCENTILE))
+    candidate_mask = filtered_mask & (np.abs(patch - z_raw) <= RELEASE_DEPTH_EPSILON_RAW)
+    ys, xs = np.nonzero(candidate_mask)
+    if ys.size == 0:
+        ys, xs = np.nonzero(filtered_mask)
+        z_raw = float(np.percentile(filtered, RELEASE_SURFACE_PERCENTILE))
+
+    u_img = float(x0 + np.mean(xs))
+    v_img = float(y0 + np.mean(ys))
+    return u_img, v_img, z_raw
+
+
+def save_release_debug_visualization(depth_img, roi, u_img, v_img, z_raw, out_path):
+    valid = depth_img[(depth_img > 0) & (depth_img < 65000)].astype(np.float32)
+    if valid.size > 0:
+        lo, hi = np.percentile(valid, [2, 98])
+        depth_norm = np.clip(
+            (depth_img.astype(np.float32) - float(lo)) / max(float(hi - lo), 1e-6),
+            0,
+            1,
+        )
+    else:
+        depth_norm = np.zeros_like(depth_img, dtype=np.float32)
+
+    vis_gray = (depth_norm * 255).astype(np.uint8)
+    vis = cv2.applyColorMap(vis_gray, cv2.COLORMAP_TURBO)
+    invalid_mask = ~((depth_img > 0) & (depth_img < 65000))
+    vis[invalid_mask] = 0
+
+    x0, y0, x1, y1 = roi
+    cv2.rectangle(vis, (x0, y0), (x1 - 1, y1 - 1), (0, 255, 255), 2)
+
+    ui = int(round(u_img))
+    vi = int(round(v_img))
+    cv2.circle(vis, (ui, vi), 6, (0, 0, 255), -1)
+    cv2.circle(vis, (ui, vi), 12, (255, 255, 255), 2)
+
+    label = f"release z_raw={z_raw:.0f} ({z_raw * DEPTH_SCALE_TO_M:.3f}m)"
+    cv2.putText(
+        vis,
+        label,
+        (max(10, x0), max(28, y0 - 12)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        vis,
+        f"pixel=({ui}, {vi}) roi=({x0},{y0})-({x1},{y1})",
+        (10, vis.shape[0] - 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.imwrite(str(out_path), vis)
 
 
 class HoverService:
@@ -257,6 +381,37 @@ class HoverService:
             raise RuntimeError(f"gripper error: {resp.get('code')} {resp.get('error')}")
         return resp
 
+    def photo_call(self, cmd: str, sock_timeout: float = 8.0, **kwargs):
+        if not os.path.exists(PHOTO_SOCKET):
+            raise RuntimeError(
+                "photo server is not running. start photo services first: python3 /home/swfu/ws/main.py"
+            )
+
+        req = {
+            "id": str(uuid.uuid4()),
+            "cmd": cmd,
+            **kwargs,
+        }
+
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(sock_timeout)
+                client.connect(PHOTO_SOCKET)
+                send_one_line(client, req)
+                raw = recv_one_line(client)
+        except OSError:
+            raise RuntimeError(
+                "failed to connect photo server. start photo services first: python3 /home/swfu/ws/main.py"
+            )
+
+        if not raw:
+            raise RuntimeError("empty response from photo server")
+
+        resp = json.loads(raw)
+        if not resp.get("ok", False):
+            raise RuntimeError(f"photo error: {resp.get('code')} {resp.get('error')}")
+        return resp
+
     def status(self):
         current_xyz_m, current_rpy_deg = current_pose_from_piper(self.piper)
         return {
@@ -269,7 +424,11 @@ class HoverService:
 
     def execute_grasp(self, req: dict):
         level = req.get("Level", req.get("level"))
-        release_joints = resolve_release_joints(level, req.get("release_joint_cmd"))
+        pre_release_pose_cmd = resolve_pre_release_pose_cmd(
+            level,
+            req.get("pre_release_pose_cmd", req.get("release_pose_cmd")),
+            req.get("release_joint_cmd"),
+        )
 
         with open(INFER_JSON, "r", encoding="utf-8") as file_obj:
             infer = json.load(file_obj)
@@ -312,6 +471,11 @@ class HoverService:
         self.gripper_call("enable")
 
         self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
+
+        # 避免撞桌
+        z_cmd = z_cmd if z_cmd>Z_PROTECT else Z_PROTECT
+
+        print("\n raw", x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw,"\n")
         self.piper.EndPoseCtrl(x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw)
         close_resp = self.gripper_call("open")
         time.sleep(APPROACH_WAIT_SEC)
@@ -319,9 +483,68 @@ class HoverService:
         close_resp = self.gripper_call("close")
         time.sleep(CLOSE_WAIT_SEC)
 
-        self.piper.MotionCtrl_2(0x01, 0x01, 40, 0x00)
-        self.piper.JointCtrl(*release_joints)
+        # 先移动到每个 Level 对应的固定预放置位，再拍照估计最终落点。
+        self.piper.MotionCtrl_2(0x01, 0x00, 40, 0x00)
+        self.piper.EndPoseCtrl(*pre_release_pose_cmd)
         time.sleep(RELEASE_WAIT_SEC)
+
+        release_capture_resp = self.photo_call("capture")
+        release_depth = np.load(DEPTH_NPY).astype(np.float32)
+        with open(CAPTURE_POSE_JSON, "r", encoding="utf-8") as file_obj:
+            release_capture_pose = json.load(file_obj)
+        release_roi = resolve_release_roi(level, release_depth.shape)
+        release_u_img, release_v_img, release_z_raw = filtered_surface_depth_in_roi(
+            release_depth, release_roi
+        )
+        save_release_debug_visualization(
+            release_depth,
+            release_roi,
+            release_u_img,
+            release_v_img,
+            release_z_raw,
+            RELEASE_DEBUG_PNG,
+        )
+
+        release_p_cam = pixel_to_camera_xyz(release_u_img, release_v_img, release_z_raw)
+        release_flange_xyz_m, release_flange_rpy_deg = pose_json_to_xyz_rpy_deg(
+            release_capture_pose
+        )
+        release_rotation = rpy_deg_to_matrix(
+            release_flange_rpy_deg[0],
+            release_flange_rpy_deg[1],
+            release_flange_rpy_deg[2],
+        )
+        t_base_release_flange = make_transform(release_rotation, release_flange_xyz_m)
+        t_base_release_cam = t_base_release_flange @ T_FLANGE_TCP @ T_TCP_CAM
+        release_surface_xyz_m = transform_point(t_base_release_cam, release_p_cam)
+
+        release_tcp_xyz_m = flange_to_tcp_xyz(release_flange_xyz_m, release_flange_rpy_deg)
+        release_target_tcp_xyz_m = release_tcp_xyz_m.copy()
+        release_target_tcp_xyz_m[2] = release_surface_xyz_m[2] + RELEASE_Z_CLEARANCE_M
+
+        release_target_flange_xyz_m = tcp_target_to_flange_cmd(
+            release_target_tcp_xyz_m, release_flange_rpy_deg
+        )
+        (
+            release_x_raw,
+            release_y_raw,
+            release_z_cmd,
+            release_rx_raw,
+            release_ry_raw,
+            release_rz_raw,
+        ) = pose_to_command_units(release_target_flange_xyz_m, release_flange_rpy_deg)
+        release_z_cmd = release_z_cmd if release_z_cmd > Z_PROTECT else Z_PROTECT
+
+        self.piper.MotionCtrl_2(0x01, 0x00, 30, 0x00)
+        self.piper.EndPoseCtrl(
+            release_x_raw,
+            release_y_raw,
+            release_z_cmd,
+            release_rx_raw,
+            release_ry_raw,
+            release_rz_raw,
+        )
+        time.sleep(1.0)
 
         open_resp = self.gripper_call("open")
 
@@ -331,7 +554,7 @@ class HoverService:
 
         return {
             "Level": level,
-            "release_joint_cmd": release_joints,
+            "pre_release_pose_cmd": pre_release_pose_cmd,
             "gripper_close": close_resp,
             "gripper_open": open_resp,
             "u_img": float(u_img),
@@ -341,6 +564,13 @@ class HoverService:
             "current_tcp_xyz_m": cur_tcp_xyz_m.tolist(),
             "target_tcp_xyz_m": target_tcp_xyz_m.tolist(),
             "hover_flange_xyz_m": hover_flange_xyz_m.tolist(),
+            "release_roi": [int(value) for value in release_roi],
+            "release_capture": release_capture_resp,
+            "release_debug_png": str(RELEASE_DEBUG_PNG),
+            "release_depth_raw": float(release_z_raw),
+            "release_p_cam_m": release_p_cam.tolist(),
+            "release_surface_xyz_m": release_surface_xyz_m.tolist(),
+            "release_target_tcp_xyz_m": release_target_tcp_xyz_m.tolist(),
         }
 
     def handle(self, req: dict):
