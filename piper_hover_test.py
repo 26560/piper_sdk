@@ -1,57 +1,91 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import time
 import json
 import math
-import numpy as np
+import os
 import socket
+import threading
+import time
+import traceback
 import uuid
+from pathlib import Path
+
+import numpy as np
 from piper_sdk import *
 
+
+SOCKET_PATH = "/tmp/piper_hover.sock"
 CAN_NAME = "pipercan0"
-
-INFER_JSON = "/home/swfu/ws/piper_ggcnn/ggcnn/captures/infer_result.json"
-DEPTH_NPY = "/home/swfu/ws/piper_ggcnn/ggcnn/captures/depth_0000.npy"
-CAPTURE_POSE_JSON = "/home/swfu/ws/piper_ggcnn/ggcnn/captures/pose_0000.json"
-
-# D405 内参
-FX = 653.9111
-FY = 653.9111
-PPX = 645.5704
-PPY = 363.8945
-
-DEPTH_SCALE_TO_M = 0.0001
-
-# 目标点上方悬停高度，防止碰桌
-HOVER_Z_OFFSET_M = 0.04
-
 GRIPPER_SOCKET = "/tmp/pika_gripper.sock"
 
-# =========================
-# 法兰盘 -> TCP(夹爪中心) 的固定变换
-# 由“同一点多姿态触碰”数据反解得到的初值
-# =========================
+INFER_JSON = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/infer_result.json")
+DEPTH_NPY = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/depth_0000.npy")
+CAPTURE_POSE_JSON = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/pose_0000.json")
+HAND_EYE_JSON = Path("/home/swfu/ws/handeye_out/handeye_best.json")
+FIXED_CAMERA_INFO_JSON = Path(
+    os.environ.get(
+        "HAND_EYE_CAMERA_INFO_JSON",
+        "/home/swfu/ws/piper_ggcnn/ggcnn/captures/camera_info.json",
+    )
+).expanduser()
+
+DEPTH_SCALE_TO_M = 0.0001
+HOVER_Z_OFFSET_M = -0.015
+
+APPROACH_WAIT_SEC = 2.0
+CLOSE_WAIT_SEC = 0.5
+RELEASE_WAIT_SEC = 2.0
+
+DEFAULT_RELEASE_JOINTS = [30000, 79447, -53706, 0, 51581, 0]
+LEVEL_RELEASE_JOINTS = {
+    "default": DEFAULT_RELEASE_JOINTS,
+    "1": [30000, 79447, -53706, 0, 51581, -30000],
+    "2": [30000, 79447, -53706, 0, 51581, 0],
+    "3": [30000, 79447, -53706, 0, 51581, 30000],
+    "4": [30000, 79447, -53706, 0, 51581, 0],
+}
+
 T_FLANGE_TCP = np.eye(4, dtype=np.float64)
 T_FLANGE_TCP[:3, 3] = np.array([0.0013, 0.0007, 0.1914], dtype=np.float64)
 
-HAND_EYE_JSON = "/home/swfu/ws/handeye_out/handeye_best.json"
-
-with open(HAND_EYE_JSON, "r", encoding="utf-8") as f:
-    handeye = json.load(f)
-
-# handeye_best.json 里这个矩阵就是：法兰 <- 相机
-T_FLANGE_CAM = np.array(handeye["T_cam2gripper"], dtype=np.float64)
-
-# 脚本真正需要的是：TCP <- 相机
+with open(HAND_EYE_JSON, "r", encoding="utf-8") as file_obj:
+    HANDEYE = json.load(file_obj)
+T_FLANGE_CAM = np.array(HANDEYE["T_cam2gripper"], dtype=np.float64)
 T_TCP_CAM = np.linalg.inv(T_FLANGE_TCP) @ T_FLANGE_CAM
 
-print("[INFO] T_FLANGE_CAM =\n", T_FLANGE_CAM)
-print("[INFO] T_TCP_CAM =\n", T_TCP_CAM)
+with open(FIXED_CAMERA_INFO_JSON, "r", encoding="utf-8") as file_obj:
+    CAMERA_INFO = json.load(file_obj)
 
-# =========================
-# 工具函数
-# =========================
+if all(key in CAMERA_INFO for key in ["depth_fx", "depth_fy", "depth_ppx", "depth_ppy"]):
+    FX = float(CAMERA_INFO["depth_fx"])
+    FY = float(CAMERA_INFO["depth_fy"])
+    PPX = float(CAMERA_INFO["depth_ppx"])
+    PPY = float(CAMERA_INFO["depth_ppy"])
+elif all(key in CAMERA_INFO for key in ["fx", "fy", "ppx", "ppy"]):
+    FX = float(CAMERA_INFO["fx"])
+    FY = float(CAMERA_INFO["fy"])
+    PPX = float(CAMERA_INFO["ppx"])
+    PPY = float(CAMERA_INFO["ppy"])
+else:
+    raise RuntimeError(f"unsupported camera_info format: {FIXED_CAMERA_INFO_JSON}")
+
+
+def recv_one_line(conn: socket.socket) -> str:
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode("utf-8").strip()
+
+
+def send_one_line(conn: socket.socket, obj: dict):
+    msg = json.dumps(obj, ensure_ascii=False) + "\n"
+    conn.sendall(msg.encode("utf-8"))
+
+
 def rpy_deg_to_matrix(roll_deg, pitch_deg, yaw_deg):
     r = math.radians(roll_deg)
     p = math.radians(pitch_deg)
@@ -61,38 +95,22 @@ def rpy_deg_to_matrix(roll_deg, pitch_deg, yaw_deg):
     cp, sp = math.cos(p), math.sin(p)
     cy, sy = math.cos(y), math.sin(y)
 
-    Rx = np.array([
-        [1, 0, 0],
-        [0, cr, -sr],
-        [0, sr, cr]
-    ], dtype=np.float64)
-
-    Ry = np.array([
-        [cp, 0, sp],
-        [0, 1, 0],
-        [-sp, 0, cp]
-    ], dtype=np.float64)
-
-    Rz = np.array([
-        [cy, -sy, 0],
-        [sy,  cy, 0],
-        [0,   0,  1]
-    ], dtype=np.float64)
-
-    return Rz @ Ry @ Rx
+    rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float64)
+    ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float64)
+    rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], dtype=np.float64)
+    return rz @ ry @ rx
 
 
-def make_transform(R, t):
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R
-    T[:3, 3] = t.reshape(3)
-    return T
+def make_transform(rotation, translation):
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = translation.reshape(3)
+    return transform
 
 
-def transform_point(T, p):
-    ph = np.array([p[0], p[1], p[2], 1.0], dtype=np.float64)
-    out = T @ ph
-    return out[:3]
+def transform_point(transform, point):
+    point_h = np.array([point[0], point[1], point[2], 1.0], dtype=np.float64)
+    return (transform @ point_h)[:3]
 
 
 def map_input_to_fullres(u_300, v_300, crop_x0, crop_y0, crop_side, input_side=300):
@@ -126,36 +144,12 @@ def pixel_to_camera_xyz(u, v, z_raw):
     return np.array([x, y, z], dtype=np.float64)
 
 
-def current_pose_from_piper(piper):
-    msg = piper.GetArmEndPoseMsgs().end_pose
-
-    x_m = msg.X_axis / 1000000.0
-    y_m = msg.Y_axis / 1000000.0
-    z_m = msg.Z_axis / 1000000.0
-
-    rx_deg = msg.RX_axis / 1000.0
-    ry_deg = msg.RY_axis / 1000.0
-    rz_deg = msg.RZ_axis / 1000.0
-
-    xyz_m = np.array([x_m, y_m, z_m], dtype=np.float64)
-    rpy_deg = np.array([rx_deg, ry_deg, rz_deg], dtype=np.float64)
-    return xyz_m, rpy_deg
-
-
 def pose_json_to_xyz_rpy_deg(pose):
-    xyz_m = np.array(
-        [pose["x_m"], pose["y_m"], pose["z_m"]],
-        dtype=np.float64,
-    )
-
+    xyz_m = np.array([pose["x_m"], pose["y_m"], pose["z_m"]], dtype=np.float64)
     raw = pose.get("raw", {})
     if {"rx", "ry", "rz"} <= raw.keys():
         rpy_deg = np.array(
-            [
-                raw["rx"] / 1000.0,
-                raw["ry"] / 1000.0,
-                raw["rz"] / 1000.0,
-            ],
+            [raw["rx"] / 1000.0, raw["ry"] / 1000.0, raw["rz"] / 1000.0],
             dtype=np.float64,
         )
     else:
@@ -167,166 +161,256 @@ def pose_json_to_xyz_rpy_deg(pose):
             ],
             dtype=np.float64,
         )
-
     return xyz_m, rpy_deg
 
 
 def pose_to_command_units(xyz_m, rpy_deg):
-    X = round(xyz_m[0] * 1000000.0)
-    Y = round(xyz_m[1] * 1000000.0)
-    Z = round(xyz_m[2] * 1000000.0)
+    return (
+        round(xyz_m[0] * 1000000.0),
+        round(xyz_m[1] * 1000000.0),
+        round(xyz_m[2] * 1000000.0),
+        round(rpy_deg[0] * 1000.0),
+        round(rpy_deg[1] * 1000.0),
+        round(rpy_deg[2] * 1000.0),
+    )
 
-    RX = round(rpy_deg[0] * 1000.0)
-    RY = round(rpy_deg[1] * 1000.0)
-    RZ = round(rpy_deg[2] * 1000.0)
-    return X, Y, Z, RX, RY, RZ
+
+def current_pose_from_piper(piper):
+    msg = piper.GetArmEndPoseMsgs().end_pose
+    xyz_m = np.array(
+        [
+            msg.X_axis / 1000000.0,
+            msg.Y_axis / 1000000.0,
+            msg.Z_axis / 1000000.0,
+        ],
+        dtype=np.float64,
+    )
+    rpy_deg = np.array(
+        [
+            msg.RX_axis / 1000.0,
+            msg.RY_axis / 1000.0,
+            msg.RZ_axis / 1000.0,
+        ],
+        dtype=np.float64,
+    )
+    return xyz_m, rpy_deg
 
 
 def flange_to_tcp_xyz(flange_xyz_m, flange_rpy_deg):
-    R_base_flange = rpy_deg_to_matrix(
-        flange_rpy_deg[0], flange_rpy_deg[1], flange_rpy_deg[2]
-    )
-    return flange_xyz_m + R_base_flange @ T_FLANGE_TCP[:3, 3]
+    rotation = rpy_deg_to_matrix(flange_rpy_deg[0], flange_rpy_deg[1], flange_rpy_deg[2])
+    return flange_xyz_m + rotation @ T_FLANGE_TCP[:3, 3]
 
 
 def tcp_target_to_flange_cmd(target_tcp_xyz_m, cmd_rpy_deg):
-    R_base_flange = rpy_deg_to_matrix(
-        cmd_rpy_deg[0], cmd_rpy_deg[1], cmd_rpy_deg[2]
-    )
-    return target_tcp_xyz_m - R_base_flange @ T_FLANGE_TCP[:3, 3]
-
-def gripper_call(cmd: str, sock_timeout: float = 5.0, **kwargs):
-    req = {
-        "id": str(uuid.uuid4()),
-        "cmd": cmd,
-        **kwargs,
-    }
-
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(sock_timeout)
-        s.connect(GRIPPER_SOCKET)
-
-        msg = json.dumps(req, ensure_ascii=False) + "\n"
-        s.sendall(msg.encode("utf-8"))
-
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-
-    if not buf:
-        raise RuntimeError("empty response from gripper server")
-
-    resp = json.loads(buf.decode("utf-8").strip())
-
-    if not resp.get("ok", False):
-        raise RuntimeError(f"gripper error: {resp.get('code')} {resp.get('error')}")
-
-    return resp
+    rotation = rpy_deg_to_matrix(cmd_rpy_deg[0], cmd_rpy_deg[1], cmd_rpy_deg[2])
+    return target_tcp_xyz_m - rotation @ T_FLANGE_TCP[:3, 3]
 
 
-# =========================
-# 主流程
-# =========================
+def resolve_release_joints(level, override=None):
+    if override is not None:
+        if not isinstance(override, (list, tuple)) or len(override) != 6:
+            raise ValueError("release_joint_cmd must contain 6 values")
+        return [int(value) for value in override]
+
+    level_key = str(level).strip().upper()
+    if level_key in LEVEL_RELEASE_JOINTS:
+        return list(LEVEL_RELEASE_JOINTS[level_key])
+    return list(LEVEL_RELEASE_JOINTS["default"])
+
+
+class HoverService:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.piper = C_PiperInterface_V2(CAN_NAME, False)
+        self.piper.ConnectPort()
+        while not self.piper.EnablePiper():
+            time.sleep(0.01)
+
+    def gripper_call(self, cmd: str, sock_timeout: float = 5.0, **kwargs):
+        if not os.path.exists(GRIPPER_SOCKET):
+            raise RuntimeError(
+                "gripper server is not running. start pika services first: python3 /home/swfu/ws/launch_pika_services.py"
+            )
+
+        req = {
+            "id": str(uuid.uuid4()),
+            "cmd": cmd,
+            **kwargs,
+        }
+
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(sock_timeout)
+                client.connect(GRIPPER_SOCKET)
+                send_one_line(client, req)
+                raw = recv_one_line(client)
+        except OSError:
+            raise RuntimeError(
+                "failed to connect gripper server. start pika services first: python3 /home/swfu/ws/launch_pika_services.py"
+            )
+
+        if not raw:
+            raise RuntimeError("empty response from gripper server")
+
+        resp = json.loads(raw)
+        if not resp.get("ok", False):
+            raise RuntimeError(f"gripper error: {resp.get('code')} {resp.get('error')}")
+        return resp
+
+    def status(self):
+        current_xyz_m, current_rpy_deg = current_pose_from_piper(self.piper)
+        return {
+            "can_name": CAN_NAME,
+            "current_pose": {
+                "xyz_m": current_xyz_m.tolist(),
+                "rpy_deg": current_rpy_deg.tolist(),
+            },
+        }
+
+    def execute_grasp(self, req: dict):
+        level = req.get("Level", req.get("level"))
+        release_joints = resolve_release_joints(level, req.get("release_joint_cmd"))
+
+        with open(INFER_JSON, "r", encoding="utf-8") as file_obj:
+            infer = json.load(file_obj)
+        depth = np.load(DEPTH_NPY).astype(np.float32)
+        with open(CAPTURE_POSE_JSON, "r", encoding="utf-8") as file_obj:
+            capture_pose = json.load(file_obj)
+
+        u_img, v_img = map_input_to_fullres(
+            infer["u_300"],
+            infer["v_300"],
+            infer["crop_x0"],
+            infer["crop_y0"],
+            infer["crop_side"],
+            input_side=infer.get("input_side", 300),
+        )
+        z_raw = robust_depth_at(depth, u_img, v_img, radius=3)
+        p_cam = pixel_to_camera_xyz(u_img, v_img, z_raw)
+
+        cap_flange_xyz_m, cap_flange_rpy_deg = pose_json_to_xyz_rpy_deg(capture_pose)
+        cur_flange_xyz_m, cur_flange_rpy_deg = current_pose_from_piper(self.piper)
+
+        base_rotation = rpy_deg_to_matrix(
+            cap_flange_rpy_deg[0],
+            cap_flange_rpy_deg[1],
+            cap_flange_rpy_deg[2],
+        )
+        t_base_flange = make_transform(base_rotation, cap_flange_xyz_m)
+        t_base_cam = t_base_flange @ T_FLANGE_TCP @ T_TCP_CAM
+        target_tcp_xyz_m = transform_point(t_base_cam, p_cam)
+        hover_tcp_xyz_m = target_tcp_xyz_m.copy()
+        hover_tcp_xyz_m[2] += HOVER_Z_OFFSET_M
+
+        keep_rpy_deg = cap_flange_rpy_deg.copy()
+        cur_tcp_xyz_m = flange_to_tcp_xyz(cur_flange_xyz_m, cur_flange_rpy_deg)
+        hover_flange_xyz_m = tcp_target_to_flange_cmd(hover_tcp_xyz_m, keep_rpy_deg)
+
+        x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw = pose_to_command_units(
+            hover_flange_xyz_m, keep_rpy_deg
+        )
+        self.gripper_call("enable")
+
+        self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
+        self.piper.EndPoseCtrl(x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw)
+        close_resp = self.gripper_call("open")
+        time.sleep(APPROACH_WAIT_SEC)
+
+        close_resp = self.gripper_call("close")
+        time.sleep(CLOSE_WAIT_SEC)
+
+        self.piper.MotionCtrl_2(0x01, 0x01, 40, 0x00)
+        self.piper.JointCtrl(*release_joints)
+        time.sleep(RELEASE_WAIT_SEC)
+
+        open_resp = self.gripper_call("open")
+
+        time.sleep(1)
+
+        self.gripper_call("disable")
+
+        return {
+            "Level": level,
+            "release_joint_cmd": release_joints,
+            "gripper_close": close_resp,
+            "gripper_open": open_resp,
+            "u_img": float(u_img),
+            "v_img": float(v_img),
+            "depth_raw": float(z_raw),
+            "p_cam_m": p_cam.tolist(),
+            "current_tcp_xyz_m": cur_tcp_xyz_m.tolist(),
+            "target_tcp_xyz_m": target_tcp_xyz_m.tolist(),
+            "hover_flange_xyz_m": hover_flange_xyz_m.tolist(),
+        }
+
+    def handle(self, req: dict):
+        req_id = req.get("id")
+        cmd = req.get("cmd")
+
+        with self.lock:
+            try:
+                if cmd == "status":
+                    data = self.status()
+                elif cmd == "grasp":
+                    data = self.execute_grasp(req)
+                else:
+                    return {
+                        "id": req_id,
+                        "ok": False,
+                        "code": "BAD_REQUEST",
+                        "error": f"unknown cmd: {cmd}",
+                    }
+
+                return {
+                    "id": req_id,
+                    "ok": True,
+                    **data,
+                }
+            except Exception as exc:
+                return {
+                    "id": req_id,
+                    "ok": False,
+                    "code": "EXCEPTION",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+
+
+def main():
+    if os.path.exists(SOCKET_PATH):
+        os.remove(SOCKET_PATH)
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    server.listen(8)
+
+    svc = HoverService()
+    print(f"[INFO] hover server listening at {SOCKET_PATH}")
+
+    while True:
+        conn, _ = server.accept()
+        with conn:
+            raw = recv_one_line(conn)
+            if not raw:
+                continue
+
+            try:
+                req = json.loads(raw)
+            except Exception:
+                send_one_line(
+                    conn,
+                    {
+                        "id": None,
+                        "ok": False,
+                        "code": "BAD_JSON",
+                        "error": "invalid json",
+                    },
+                )
+                continue
+
+            resp = svc.handle(req)
+            send_one_line(conn, resp)
+
+
 if __name__ == "__main__":
-    # 1) 读取 GG-CNN 输出
-    with open(INFER_JSON, "r", encoding="utf-8") as f:
-        infer = json.load(f)
-
-    depth = np.load(DEPTH_NPY).astype(np.float32)
-    with open(CAPTURE_POSE_JSON, "r", encoding="utf-8") as f:
-        capture_pose = json.load(f)
-
-    u_300 = infer["u_300"]
-    v_300 = infer["v_300"]
-    input_side = infer.get("input_side", 300)
-    crop_x0 = infer["crop_x0"]
-    crop_y0 = infer["crop_y0"]
-    crop_side = infer["crop_side"]
-
-    # 2) 输入网格抓取点 -> 原图像素
-    u_img, v_img = map_input_to_fullres(
-        u_300, v_300, crop_x0, crop_y0, crop_side, input_side=input_side
-    )
-
-    # 3) 取深度并反投影到相机坐标系
-    z_raw = robust_depth_at(depth, u_img, v_img, radius=3)
-    p_cam = pixel_to_camera_xyz(u_img, v_img, z_raw)
-
-    # 4) 连接机械臂，按官方 demo 方式使能
-    piper = C_PiperInterface_V2(CAN_NAME, False)
-    piper.ConnectPort()
-    while not piper.EnablePiper():
-        time.sleep(0.01)
-
-    # 5) 读取拍照时保存的法兰盘位姿，用它复现拍照时的 base <- flange
-    cap_flange_xyz_m, cap_flange_rpy_deg = pose_json_to_xyz_rpy_deg(capture_pose)
-
-    # 当前位姿只用于打印调试，不参与目标点解算
-    cur_flange_xyz_m, cur_flange_rpy_deg = current_pose_from_piper(piper)
-
-    # 6) 构建 T_base_flange
-    R_base_flange = rpy_deg_to_matrix(
-        cap_flange_rpy_deg[0], cap_flange_rpy_deg[1], cap_flange_rpy_deg[2]
-    )
-    T_base_flange = make_transform(R_base_flange, cap_flange_xyz_m)
-
-    # 7) 链式求解：base <- flange <- tcp <- cam
-    T_base_cam = T_base_flange @ T_FLANGE_TCP @ T_TCP_CAM
-    target_tcp_xyz_m = transform_point(T_base_cam, p_cam)
-
-    # 8) 在目标 TCP 点上方悬停
-    hover_tcp_xyz_m = target_tcp_xyz_m.copy()
-    hover_tcp_xyz_m[2] += HOVER_Z_OFFSET_M
-
-    # 9) 姿态保持拍照时法兰盘姿态，避免重复运行时再次受当前姿态影响
-    keep_rpy_deg = cap_flange_rpy_deg.copy()
-
-    # 10) 目标 TCP -> 法兰盘控制点
-    cur_tcp_xyz_m = flange_to_tcp_xyz(cur_flange_xyz_m, cur_flange_rpy_deg)
-    hover_flange_xyz_m = tcp_target_to_flange_cmd(hover_tcp_xyz_m, keep_rpy_deg)
-
-    # 11) 打印结果
-    print("=" * 80)
-    print("[INFO] infer_result:")
-    print(json.dumps(infer, indent=2, ensure_ascii=False))
-    print("[INFO] capture pose file:", CAPTURE_POSE_JSON)
-    print("[INFO] capture pose request_timestamp:", capture_pose.get("request_timestamp"))
-    print("[INFO] capture pose worker_capture_timestamp:", capture_pose.get("worker_capture_timestamp"))
-    print("[INFO] camera point (m):", p_cam.tolist())
-    print("[INFO] u_img, v_img:", u_img, v_img)
-    print("[INFO] depth_raw:", z_raw, " depth_m:", z_raw * DEPTH_SCALE_TO_M)
-    print("[INFO] captured flange pose xyz(m):", cap_flange_xyz_m.tolist())
-    print("[INFO] captured flange pose rpy(deg):", cap_flange_rpy_deg.tolist())
-    print("[INFO] current flange pose xyz(m):", cur_flange_xyz_m.tolist())
-    print("[INFO] current flange pose rpy(deg):", cur_flange_rpy_deg.tolist())
-    print("[INFO] current tcp xyz(m):", cur_tcp_xyz_m.tolist())
-    print("[INFO] target tcp point in base (m):", target_tcp_xyz_m.tolist())
-    print("[INFO] hover tcp point in base (m):", hover_tcp_xyz_m.tolist())
-    print("[INFO] hover flange cmd xyz(m):", hover_flange_xyz_m.tolist())
-    print("=" * 80)
-
-    # 12) 转成控制命令单位（不再强行覆盖 RX/RY/RZ）
-    X, Y, Z, RX, RY, RZ = pose_to_command_units(hover_flange_xyz_m, keep_rpy_deg)
-
-    # 13) 按官方 demo 风格持续发送 hover 位姿
-    print(X, Y, Z, RX, RY, RZ, sep=',')
-    piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
-    piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
-    # TODO：这里读状态经常会返回到达失败，干脆延迟一定时间后再控制夹爪了
-    
-    # status = piper.GetArmStatus()
-    # while (not status.arm_status.motion_status):
-    #     time.sleep(0.3)
-    # print(status, "\n\n")
-    # print(status.arm_status.motion_status)
-    time.sleep(3)
-    print(gripper_call("close"))
-    print(gripper_call("status"))
-    time.sleep(3)
-    print(gripper_call("open"))
-    print(gripper_call("status"))
-
-    print("[DONE] hover command finished")
+    main()
