@@ -5,6 +5,8 @@ __pycache__
 *.7z
 *.zip
 *.tar
+*.jpg
 piper_sdk.egg-info
 dist
 build
+piper_sdk/demo/V2/package.json
