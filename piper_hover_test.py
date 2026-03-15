@@ -41,25 +41,38 @@ CLOSE_WAIT_SEC = 0.5
 RELEASE_WAIT_SEC = 2.0
 
 Z_PROTECT = 175000
-RELEASE_Z_CLEARANCE_M = 0.03
+RELEASE_Z_CLEARANCE_M = 0.015
 RELEASE_DEPTH_EPSILON_RAW = 80.0
 RELEASE_IQR_MARGIN_RAW = 200.0
 RELEASE_SURFACE_PERCENTILE = 10.0
 
+# 预放置位置
 DEFAULT_PRE_RELEASE_POSE_CMD = [221813, 128064, 252747, 180000, 17678, -150000]
 LEVEL_PRE_RELEASE_POSE_CMD = {
     "default": DEFAULT_PRE_RELEASE_POSE_CMD,
-    "1": [-48436, 274696, 301972, 180000, 27678, -80000],
+    "1": [-200409, 158528, 251952, 179844, 25004, -37527],
     "2": [262112, 95401, 301972, 180000, 27678, -160000],
     "3": [274696, 48436, 301972, 180000, 27678, -170000],
     "4": [278933, 0, 301972, 180000, 27678, 180000],
 }
+
+# 正式放置位置
+DEFAULT_FORMAL_RELEASE_POSE_CMD = list(DEFAULT_PRE_RELEASE_POSE_CMD)
+LEVEL_FORMAL_RELEASE_POSE_CMD = {
+    "default": list(DEFAULT_FORMAL_RELEASE_POSE_CMD),
+    "1": [-322236, 255206, 189165, 179901, 20073, -37539],
+    "2": list(LEVEL_PRE_RELEASE_POSE_CMD["2"]),
+    "3": list(LEVEL_PRE_RELEASE_POSE_CMD["3"]),
+    "4": list(LEVEL_PRE_RELEASE_POSE_CMD["4"]),
+}
+
+# 自适应高度ROI
 LEVEL_RELEASE_ROI = {
-    "default": (512, 245, 768, 418),
-    "1": (102, 245, 410, 418),
+    "default": (784, 291, 984, 541),
+    "1": (580, 70, 816, 336),
     "2": (333, 245, 640, 418),
     "3": (640, 245, 947, 418),
-    "4": (870, 245, 1178, 418),
+    "4": (784, 291, 984, 541),
 }
 
 T_FLANGE_TCP = np.eye(4, dtype=np.float64)
@@ -248,6 +261,33 @@ def resolve_pre_release_pose_cmd(level, pose_override=None, joint_override=None)
     return list(LEVEL_PRE_RELEASE_POSE_CMD["default"])
 
 
+def resolve_formal_release_pose_cmd(level, pose_override=None, joint_override=None):
+    if pose_override is not None:
+        if not isinstance(pose_override, (list, tuple)) or len(pose_override) != 6:
+            raise ValueError("formal_release_pose_cmd must contain 6 values")
+        return [int(value) for value in pose_override]
+
+    if joint_override is not None:
+        if not isinstance(joint_override, (list, tuple)) or len(joint_override) != 6:
+            raise ValueError("formal_release_joint_cmd must contain 6 values")
+        return joint_cmd_to_pose_cmd([int(value) for value in joint_override])
+
+    level_key = str(level).strip().upper()
+    if level_key in LEVEL_FORMAL_RELEASE_POSE_CMD:
+        return list(LEVEL_FORMAL_RELEASE_POSE_CMD[level_key])
+    return list(LEVEL_FORMAL_RELEASE_POSE_CMD["default"])
+
+
+def pose_cmd_to_xyz_rpy_deg(pose_cmd):
+    if not isinstance(pose_cmd, (list, tuple)) or len(pose_cmd) != 6:
+        raise ValueError("pose_cmd must contain 6 values")
+
+    pose_cmd = [int(value) for value in pose_cmd]
+    xyz_m = np.array(pose_cmd[:3], dtype=np.float64) / 1000000.0
+    rpy_deg = np.array(pose_cmd[3:], dtype=np.float64) / 1000.0
+    return xyz_m, rpy_deg
+
+
 def resolve_release_roi(level, image_shape):
     h, w = image_shape[:2]
     level_key = str(level).strip().upper()
@@ -429,7 +469,14 @@ class HoverService:
             req.get("pre_release_pose_cmd", req.get("release_pose_cmd")),
             req.get("release_joint_cmd"),
         )
+        formal_release_pose_cmd = resolve_formal_release_pose_cmd(
+            level,
+            req.get("formal_release_pose_cmd"),
+            req.get("formal_release_joint_cmd"),
+        )
 
+
+        # ROI 自适应深度
         with open(INFER_JSON, "r", encoding="utf-8") as file_obj:
             infer = json.load(file_obj)
         depth = np.load(DEPTH_NPY).astype(np.float32)
@@ -470,23 +517,24 @@ class HoverService:
         )
         self.gripper_call("enable")
 
+        # 移动到夹取点
         self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
-
-        # 避免撞桌
-        z_cmd = z_cmd if z_cmd>Z_PROTECT else Z_PROTECT
-
-        print("\n raw", x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw,"\n")
+        z_cmd = z_cmd if z_cmd>Z_PROTECT else Z_PROTECT     # 避免撞桌
+        print("夹取点：", x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw)
         self.piper.EndPoseCtrl(x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw)
         close_resp = self.gripper_call("open")
         time.sleep(APPROACH_WAIT_SEC)
+        print("夹取点", self.piper.GetArmStatus(), "\n\n")
 
         close_resp = self.gripper_call("close")
         time.sleep(CLOSE_WAIT_SEC)
 
         # 先移动到每个 Level 对应的固定预放置位，再拍照估计最终落点。
+        print("预放置点：", *pre_release_pose_cmd)
         self.piper.MotionCtrl_2(0x01, 0x00, 40, 0x00)
         self.piper.EndPoseCtrl(*pre_release_pose_cmd)
         time.sleep(RELEASE_WAIT_SEC)
+        print("预放置点", self.piper.GetArmStatus(), "\n\n")
 
         release_capture_resp = self.photo_call("capture")
         release_depth = np.load(DEPTH_NPY).astype(np.float32)
@@ -518,12 +566,16 @@ class HoverService:
         t_base_release_cam = t_base_release_flange @ T_FLANGE_TCP @ T_TCP_CAM
         release_surface_xyz_m = transform_point(t_base_release_cam, release_p_cam)
 
-        release_tcp_xyz_m = flange_to_tcp_xyz(release_flange_xyz_m, release_flange_rpy_deg)
-        release_target_tcp_xyz_m = release_tcp_xyz_m.copy()
+        formal_release_flange_xyz_m, formal_release_rpy_deg = pose_cmd_to_xyz_rpy_deg(
+            formal_release_pose_cmd
+        )
+        release_target_tcp_xyz_m = flange_to_tcp_xyz(
+            formal_release_flange_xyz_m, formal_release_rpy_deg
+        )
         release_target_tcp_xyz_m[2] = release_surface_xyz_m[2] + RELEASE_Z_CLEARANCE_M
 
         release_target_flange_xyz_m = tcp_target_to_flange_cmd(
-            release_target_tcp_xyz_m, release_flange_rpy_deg
+            release_target_tcp_xyz_m, formal_release_rpy_deg
         )
         (
             release_x_raw,
@@ -532,10 +584,18 @@ class HoverService:
             release_rx_raw,
             release_ry_raw,
             release_rz_raw,
-        ) = pose_to_command_units(release_target_flange_xyz_m, release_flange_rpy_deg)
+        ) = pose_to_command_units(release_target_flange_xyz_m, formal_release_rpy_deg)
         release_z_cmd = release_z_cmd if release_z_cmd > Z_PROTECT else Z_PROTECT
 
         self.piper.MotionCtrl_2(0x01, 0x00, 30, 0x00)
+        print("正式放置点", 
+            release_x_raw,
+            release_y_raw,
+            release_z_cmd,
+            release_rx_raw,
+            release_ry_raw,
+            release_rz_raw)
+        
         self.piper.EndPoseCtrl(
             release_x_raw,
             release_y_raw,
@@ -544,17 +604,39 @@ class HoverService:
             release_ry_raw,
             release_rz_raw,
         )
-        time.sleep(1.0)
+        time.sleep(1.5)
+        print("正式放置点", self.piper.GetArmStatus(), "\n\n")
 
         open_resp = self.gripper_call("open")
 
         time.sleep(1)
+        print("预上抬：", 
+            release_x_raw,
+            release_y_raw,
+            release_z_cmd,
+            release_rx_raw,
+            release_ry_raw,
+            release_rz_raw)
+        
+        self.piper.EndPoseCtrl(
+            release_x_raw,
+            release_y_raw,
+            release_z_cmd + 100000,
+            release_rx_raw,
+            release_ry_raw,
+            release_rz_raw,
+        )
+
+        time.sleep(1)
+
+        print("预上抬：", self.piper.GetArmStatus(), "\n\n")
 
         self.gripper_call("disable")
 
         return {
             "Level": level,
             "pre_release_pose_cmd": pre_release_pose_cmd,
+            "formal_release_pose_cmd": formal_release_pose_cmd,
             "gripper_close": close_resp,
             "gripper_open": open_resp,
             "u_img": float(u_img),

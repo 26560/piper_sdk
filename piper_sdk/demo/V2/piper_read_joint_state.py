@@ -12,5 +12,5 @@ if __name__ == "__main__":
     while True:
         print(piper.GetArmJointMsgs())
         print(piper.GetArmGripperMsgs())
-        time.sleep(0.005)
+        input()
     
