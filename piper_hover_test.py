@@ -34,13 +34,13 @@ FIXED_CAMERA_INFO_JSON = Path(
 ).expanduser()
 
 DEPTH_SCALE_TO_M = 0.0001
-HOVER_Z_OFFSET_M = -0.025
+HOVER_Z_OFFSET_M = -0.028
 
 APPROACH_WAIT_SEC = 1.5
 CLOSE_WAIT_SEC = 0.5
 RELEASE_WAIT_SEC = 2.0
 
-Z_PROTECT = 175000
+Z_PROTECT = 171500
 RELEASE_Z_CLEARANCE_M = 0.015
 RELEASE_DEPTH_EPSILON_RAW = 80.0
 RELEASE_IQR_MARGIN_RAW = 200.0
@@ -529,6 +529,12 @@ class HoverService:
         close_resp = self.gripper_call("close")
         time.sleep(CLOSE_WAIT_SEC)
 
+        # 夹取点上抬
+        print("夹取上抬：", x_raw, y_raw, z_cmd + 100000, rx_raw, ry_raw, rz_raw)
+        self.piper.EndPoseCtrl(x_raw, y_raw, z_cmd + 100000, rx_raw, ry_raw, rz_raw)
+        time.sleep(APPROACH_WAIT_SEC)
+        print("夹取上抬", self.piper.GetArmStatus(), "\n\n")
+
         # 先移动到每个 Level 对应的固定预放置位，再拍照估计最终落点。
         print("预放置点：", *pre_release_pose_cmd)
         self.piper.MotionCtrl_2(0x01, 0x00, 40, 0x00)
@@ -613,7 +619,7 @@ class HoverService:
         print("预上抬：", 
             release_x_raw,
             release_y_raw,
-            release_z_cmd,
+            release_z_cmd + 50000,
             release_rx_raw,
             release_ry_raw,
             release_rz_raw)
@@ -621,7 +627,7 @@ class HoverService:
         self.piper.EndPoseCtrl(
             release_x_raw,
             release_y_raw,
-            release_z_cmd + 100000,
+            release_z_cmd + 50000,
             release_rx_raw,
             release_ry_raw,
             release_rz_raw,
