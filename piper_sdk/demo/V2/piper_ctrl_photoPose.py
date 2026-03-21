@@ -64,6 +64,27 @@ class PhotoPoseService:
                 self.piper.EnableFilterAbnormalData()
             except Exception:
                 pass
+        
+    def waitMove(self, timeout=10.0, interval=0.3):
+        deadline = time.monotonic() + timeout
+
+        while True:
+            time.sleep(interval)    #TODO: advise change to tiemstamp
+            status = self.piper.GetArmStatus()
+
+            if status.arm_status.motion_status == 0x00:
+                print(f"{status.arm_status.motion_status}")
+                return
+
+            if status.arm_status.arm_status != 0x00:
+                raise RuntimeError(f"机械臂运行出错：{status}")
+
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(
+                    f"机械臂等待超时，timeout={timeout}s, 当前状态={status}"
+                )
+            
 
     def current_pose(self):
         msg = self.piper.GetArmEndPoseMsgs().end_pose
@@ -101,7 +122,8 @@ class PhotoPoseService:
             PHOTO_POSE["RY"],
             PHOTO_POSE["RZ"],
         )
-        time.sleep(PHOTO_POSE["settle_sec"])
+        
+        self.waitMove()
 
         pose = self.current_pose()
         pose["target_raw"] = {
@@ -159,6 +181,9 @@ class PhotoPoseService:
                     "traceback": traceback.format_exc(),
                 }
 
+
+        
+        
 
 def main():
     if os.path.exists(SOCKET_PATH):

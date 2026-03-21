@@ -25,6 +25,8 @@ INFER_JSON = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/infer_result.json")
 DEPTH_NPY = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/depth_0000.npy")
 CAPTURE_POSE_JSON = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/pose_0000.json")
 RELEASE_DEBUG_PNG = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/release_depth_debug.png")
+HOVER_ERROR_LOG_DIR = Path("/home/swfu/ws/piper_ggcnn/ggcnn/captures/hover_error_logs")
+HOVER_ERROR_LOG_LATEST = HOVER_ERROR_LOG_DIR / "latest.json"
 HAND_EYE_JSON = Path("/home/swfu/ws/handeye_out/handeye_best.json")
 FIXED_CAMERA_INFO_JSON = Path(
     os.environ.get(
@@ -34,7 +36,7 @@ FIXED_CAMERA_INFO_JSON = Path(
 ).expanduser()
 
 DEPTH_SCALE_TO_M = 0.0001
-HOVER_Z_OFFSET_M = -0.028
+HOVER_Z_OFFSET_M = -0.025
 
 APPROACH_WAIT_SEC = 1.5
 CLOSE_WAIT_SEC = 0.5
@@ -42,16 +44,17 @@ RELEASE_WAIT_SEC = 2.0
 
 Z_PROTECT = 171500
 RELEASE_Z_CLEARANCE_M = 0.015
-RELEASE_DEPTH_EPSILON_RAW = 80.0
-RELEASE_IQR_MARGIN_RAW = 200.0
-RELEASE_SURFACE_PERCENTILE = 10.0
+RELEASE_LOCAL_PLANE_MIN_POINTS = 12
+RELEASE_LOCAL_PLANE_MIN_INLIERS = 8
+RELEASE_LOCAL_PLANE_RESIDUAL_THRESH_M = 0.004
+RELEASE_LOCAL_FALLBACK_PERCENTILE = 95.0
 
 # 预放置位置
 DEFAULT_PRE_RELEASE_POSE_CMD = [221813, 128064, 252747, 180000, 17678, -150000]
 LEVEL_PRE_RELEASE_POSE_CMD = {
     "default": DEFAULT_PRE_RELEASE_POSE_CMD,
     "1": [-200409, 158528, 251952, 179844, 25004, -37527],
-    "2": [262112, 95401, 301972, 180000, 27678, -160000],
+    "2": [-124654, 162978, 252541, -178733, 36871, -45565],
     "3": [274696, 48436, 301972, 180000, 27678, -170000],
     "4": [278933, 0, 301972, 180000, 27678, 180000],
 }
@@ -61,7 +64,7 @@ DEFAULT_FORMAL_RELEASE_POSE_CMD = list(DEFAULT_PRE_RELEASE_POSE_CMD)
 LEVEL_FORMAL_RELEASE_POSE_CMD = {
     "default": list(DEFAULT_FORMAL_RELEASE_POSE_CMD),
     "1": [-322236, 255206, 189165, 179901, 20073, -37539],
-    "2": list(LEVEL_PRE_RELEASE_POSE_CMD["2"]),
+    "2": [-251293, 339066, 171239, 180000, 27197, -45066],
     "3": list(LEVEL_PRE_RELEASE_POSE_CMD["3"]),
     "4": list(LEVEL_PRE_RELEASE_POSE_CMD["4"]),
 }
@@ -73,6 +76,14 @@ LEVEL_RELEASE_ROI = {
     "2": (333, 245, 640, 418),
     "3": (640, 245, 947, 418),
     "4": (784, 291, 984, 541),
+}
+
+LEVEL_RELEASE_LOCAL_RADIUS_M = {
+    "default": 0.18,
+    "1": 0.18,
+    "2": 0.18,
+    "3": 0.18,
+    "4": 0.18,
 }
 
 T_FLANGE_TCP = np.eye(4, dtype=np.float64)
@@ -115,6 +126,43 @@ def send_one_line(conn: socket.socket, obj: dict):
     conn.sendall(msg.encode("utf-8"))
 
 
+def save_json_atomic(path: Path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as file_obj:
+        json.dump(obj, file_obj, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+
+def to_jsonable(obj):
+    if isinstance(obj, dict):
+        return {str(key): to_jsonable(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(value) for value in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
+def path_debug_info(path: Path):
+    info = {
+        "path": str(path),
+        "exists": path.exists(),
+    }
+    if path.exists():
+        stat = path.stat()
+        info["size_bytes"] = int(stat.st_size)
+        info["mtime_epoch"] = float(stat.st_mtime)
+        info["mtime_local"] = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)
+        )
+    return info
+
+
 def rpy_deg_to_matrix(roll_deg, pitch_deg, yaw_deg):
     r = math.radians(roll_deg)
     p = math.radians(pitch_deg)
@@ -140,6 +188,14 @@ def make_transform(rotation, translation):
 def transform_point(transform, point):
     point_h = np.array([point[0], point[1], point[2], 1.0], dtype=np.float64)
     return (transform @ point_h)[:3]
+
+
+def transform_points(transform, points):
+    if points.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    ones = np.ones((points.shape[0], 1), dtype=np.float64)
+    points_h = np.concatenate([points, ones], axis=1)
+    return (transform @ points_h.T).T[:, :3]
 
 
 def map_input_to_fullres(u_300, v_300, crop_x0, crop_y0, crop_side, input_side=300):
@@ -301,36 +357,123 @@ def resolve_release_roi(level, image_shape):
     return x0, y0, x1, y1
 
 
-def filtered_surface_depth_in_roi(depth_img, roi, valid_max=65000):
+def resolve_release_local_radius_m(level):
+    level_key = str(level).strip().upper()
+    return float(
+        LEVEL_RELEASE_LOCAL_RADIUS_M.get(
+            level_key, LEVEL_RELEASE_LOCAL_RADIUS_M["default"]
+        )
+    )
+
+
+def build_base_camera_transform(capture_pose):
+    flange_xyz_m, flange_rpy_deg = pose_json_to_xyz_rpy_deg(capture_pose)
+    rotation = rpy_deg_to_matrix(
+        flange_rpy_deg[0],
+        flange_rpy_deg[1],
+        flange_rpy_deg[2],
+    )
+    t_base_flange = make_transform(rotation, flange_xyz_m)
+    return t_base_flange @ T_FLANGE_TCP @ T_TCP_CAM
+
+
+def project_base_point_to_camera_pixel(base_point_m, t_base_cam):
+    base_point_h = np.array(
+        [base_point_m[0], base_point_m[1], base_point_m[2], 1.0], dtype=np.float64
+    )
+    cam_point = (np.linalg.inv(t_base_cam) @ base_point_h)[:3]
+    if cam_point[2] <= 1e-9:
+        raise ValueError(f"point is behind camera: {cam_point.tolist()}")
+
+    u_img = cam_point[0] * FX / cam_point[2] + PPX
+    v_img = cam_point[1] * FY / cam_point[2] + PPY
+    return np.array([u_img, v_img], dtype=np.float64), cam_point
+
+
+def collect_release_roi_points(depth_img, roi, t_base_cam, valid_max=65000):
     x0, y0, x1, y1 = roi
     patch = depth_img[y0:y1, x0:x1]
     valid_mask = (patch > 0) & (patch < valid_max)
-    valid = patch[valid_mask].astype(np.float32)
-    if valid.size == 0:
+    if not np.any(valid_mask):
         raise ValueError(f"No valid depth in release ROI {roi}")
 
-    q1 = float(np.percentile(valid, 25))
-    q3 = float(np.percentile(valid, 75))
-    iqr = max(q3 - q1, 1.0)
-    lo = max(1.0, q1 - 1.5 * iqr)
-    hi = min(float(valid_max - 1), q3 + 1.5 * iqr + RELEASE_IQR_MARGIN_RAW)
+    ys, xs = np.nonzero(valid_mask)
+    u_img = (x0 + xs).astype(np.float64)
+    v_img = (y0 + ys).astype(np.float64)
+    z_raw = patch[valid_mask].astype(np.float64)
+    z_m = z_raw * DEPTH_SCALE_TO_M
 
-    filtered_mask = valid_mask & (patch >= lo) & (patch <= hi)
-    filtered = patch[filtered_mask].astype(np.float32)
-    if filtered.size == 0:
-        filtered_mask = valid_mask
-        filtered = valid
+    cam_x = (u_img - PPX) * z_m / FX
+    cam_y = (v_img - PPY) * z_m / FY
+    cam_points = np.column_stack([cam_x, cam_y, z_m])
+    base_points = transform_points(t_base_cam, cam_points)
 
-    z_raw = float(np.percentile(filtered, RELEASE_SURFACE_PERCENTILE))
-    candidate_mask = filtered_mask & (np.abs(patch - z_raw) <= RELEASE_DEPTH_EPSILON_RAW)
-    ys, xs = np.nonzero(candidate_mask)
-    if ys.size == 0:
-        ys, xs = np.nonzero(filtered_mask)
-        z_raw = float(np.percentile(filtered, RELEASE_SURFACE_PERCENTILE))
+    return {
+        "u_img": u_img,
+        "v_img": v_img,
+        "z_raw": z_raw,
+        "cam_points": cam_points,
+        "base_points": base_points,
+    }
 
-    u_img = float(x0 + np.mean(xs))
-    v_img = float(y0 + np.mean(ys))
-    return u_img, v_img, z_raw
+
+def estimate_local_surface_at_target(roi_points, target_xy_m, radius_m):
+    base_points = roi_points["base_points"]
+    delta_xy = base_points[:, :2] - np.asarray(target_xy_m, dtype=np.float64).reshape(1, 2)
+    dist2 = np.sum(delta_xy * delta_xy, axis=1)
+    local_mask = dist2 <= radius_m * radius_m
+    if not np.any(local_mask):
+        raise ValueError(
+            f"No valid release points within {radius_m:.3f}m of target XY {target_xy_m}"
+        )
+
+    local_base = base_points[local_mask]
+    local_cam = roi_points["cam_points"][local_mask]
+    local_u = roi_points["u_img"][local_mask]
+    local_v = roi_points["v_img"][local_mask]
+    local_z_raw = roi_points["z_raw"][local_mask]
+    local_dist2 = dist2[local_mask]
+
+    nearest_idx = int(np.argmin(local_dist2))
+    debug_u = float(local_u[nearest_idx])
+    debug_v = float(local_v[nearest_idx])
+    debug_z_raw = float(local_z_raw[nearest_idx])
+    debug_p_cam = local_cam[nearest_idx]
+
+    surface_z = None
+    if local_base.shape[0] >= RELEASE_LOCAL_PLANE_MIN_POINTS:
+        design = np.column_stack(
+            [local_base[:, 0], local_base[:, 1], np.ones(local_base.shape[0], dtype=np.float64)]
+        )
+        coeffs, _, rank, _ = np.linalg.lstsq(design, local_base[:, 2], rcond=None)
+        if rank == 3:
+            residuals = local_base[:, 2] - (design @ coeffs)
+            inlier_mask = np.abs(residuals) <= RELEASE_LOCAL_PLANE_RESIDUAL_THRESH_M
+            if np.count_nonzero(inlier_mask) >= RELEASE_LOCAL_PLANE_MIN_INLIERS:
+                inlier_base = local_base[inlier_mask]
+                design_inlier = np.column_stack(
+                    [
+                        inlier_base[:, 0],
+                        inlier_base[:, 1],
+                        np.ones(inlier_base.shape[0], dtype=np.float64),
+                    ]
+                )
+                coeffs, _, rank, _ = np.linalg.lstsq(
+                    design_inlier, inlier_base[:, 2], rcond=None
+                )
+                if rank == 3:
+                    target_x, target_y = target_xy_m
+                    surface_z = float(coeffs[0] * target_x + coeffs[1] * target_y + coeffs[2])
+
+    if surface_z is None:
+        surface_z = float(
+            np.percentile(local_base[:, 2], RELEASE_LOCAL_FALLBACK_PERCENTILE)
+        )
+
+    surface_xyz_m = np.array(
+        [target_xy_m[0], target_xy_m[1], surface_z], dtype=np.float64
+    )
+    return surface_xyz_m, debug_u, debug_v, debug_z_raw, debug_p_cam
 
 
 def save_release_debug_visualization(depth_img, roi, u_img, v_img, z_raw, out_path):
@@ -358,7 +501,7 @@ def save_release_debug_visualization(depth_img, roi, u_img, v_img, z_raw, out_pa
     cv2.circle(vis, (ui, vi), 6, (0, 0, 255), -1)
     cv2.circle(vis, (ui, vi), 12, (255, 255, 255), 2)
 
-    label = f"release z_raw={z_raw:.0f} ({z_raw * DEPTH_SCALE_TO_M:.3f}m)"
+    label = f"debug z_raw={z_raw:.0f} ({z_raw * DEPTH_SCALE_TO_M:.3f}m)"
     cv2.putText(
         vis,
         label,
@@ -462,204 +605,378 @@ class HoverService:
             },
         }
 
-    def execute_grasp(self, req: dict):
-        level = req.get("Level", req.get("level"))
-        pre_release_pose_cmd = resolve_pre_release_pose_cmd(
-            level,
-            req.get("pre_release_pose_cmd", req.get("release_pose_cmd")),
-            req.get("release_joint_cmd"),
-        )
-        formal_release_pose_cmd = resolve_formal_release_pose_cmd(
-            level,
-            req.get("formal_release_pose_cmd"),
-            req.get("formal_release_joint_cmd"),
-        )
+    def write_error_snapshot(self, req, stage, debug_ctx, exc):
+        req_id = req.get("id", "unknown")
+        timestamp = time.time()
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(timestamp))
+        file_path = HOVER_ERROR_LOG_DIR / f"{stamp}_{req_id}_error.json"
 
+        arm_pose = None
+        arm_status = None
+        arm_status_error = None
+        try:
+            current_xyz_m, current_rpy_deg = current_pose_from_piper(self.piper)
+            arm_pose = {
+                "xyz_m": current_xyz_m.tolist(),
+                "rpy_deg": current_rpy_deg.tolist(),
+            }
+        except Exception as pose_exc:
+            arm_pose = {
+                "error": str(pose_exc),
+            }
 
-        # ROI 自适应深度
-        with open(INFER_JSON, "r", encoding="utf-8") as file_obj:
-            infer = json.load(file_obj)
-        depth = np.load(DEPTH_NPY).astype(np.float32)
-        with open(CAPTURE_POSE_JSON, "r", encoding="utf-8") as file_obj:
-            capture_pose = json.load(file_obj)
+        try:
+            arm_status = str(self.piper.GetArmStatus())
+        except Exception as status_exc:
+            arm_status_error = str(status_exc)
 
-        u_img, v_img = map_input_to_fullres(
-            infer["u_300"],
-            infer["v_300"],
-            infer["crop_x0"],
-            infer["crop_y0"],
-            infer["crop_side"],
-            input_side=infer.get("input_side", 300),
-        )
-        z_raw = robust_depth_at(depth, u_img, v_img, radius=3)
-        p_cam = pixel_to_camera_xyz(u_img, v_img, z_raw)
-
-        cap_flange_xyz_m, cap_flange_rpy_deg = pose_json_to_xyz_rpy_deg(capture_pose)
-        cur_flange_xyz_m, cur_flange_rpy_deg = current_pose_from_piper(self.piper)
-
-        base_rotation = rpy_deg_to_matrix(
-            cap_flange_rpy_deg[0],
-            cap_flange_rpy_deg[1],
-            cap_flange_rpy_deg[2],
-        )
-        t_base_flange = make_transform(base_rotation, cap_flange_xyz_m)
-        t_base_cam = t_base_flange @ T_FLANGE_TCP @ T_TCP_CAM
-        target_tcp_xyz_m = transform_point(t_base_cam, p_cam)
-        hover_tcp_xyz_m = target_tcp_xyz_m.copy()
-        hover_tcp_xyz_m[2] += HOVER_Z_OFFSET_M
-
-        keep_rpy_deg = cap_flange_rpy_deg.copy()
-        cur_tcp_xyz_m = flange_to_tcp_xyz(cur_flange_xyz_m, cur_flange_rpy_deg)
-        hover_flange_xyz_m = tcp_target_to_flange_cmd(hover_tcp_xyz_m, keep_rpy_deg)
-
-        x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw = pose_to_command_units(
-            hover_flange_xyz_m, keep_rpy_deg
-        )
-        self.gripper_call("enable")
-
-        # 移动到夹取点
-        self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
-        z_cmd = z_cmd if z_cmd>Z_PROTECT else Z_PROTECT     # 避免撞桌
-        print("夹取点：", x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw)
-        self.piper.EndPoseCtrl(x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw)
-        close_resp = self.gripper_call("open")
-        time.sleep(APPROACH_WAIT_SEC)
-        print("夹取点", self.piper.GetArmStatus(), "\n\n")
-
-        close_resp = self.gripper_call("close")
-        time.sleep(CLOSE_WAIT_SEC)
-
-        # 夹取点上抬
-        print("夹取上抬：", x_raw, y_raw, z_cmd + 100000, rx_raw, ry_raw, rz_raw)
-        self.piper.EndPoseCtrl(x_raw, y_raw, z_cmd + 100000, rx_raw, ry_raw, rz_raw)
-        time.sleep(APPROACH_WAIT_SEC)
-        print("夹取上抬", self.piper.GetArmStatus(), "\n\n")
-
-        # 先移动到每个 Level 对应的固定预放置位，再拍照估计最终落点。
-        print("预放置点：", *pre_release_pose_cmd)
-        self.piper.MotionCtrl_2(0x01, 0x00, 40, 0x00)
-        self.piper.EndPoseCtrl(*pre_release_pose_cmd)
-        time.sleep(RELEASE_WAIT_SEC)
-        print("预放置点", self.piper.GetArmStatus(), "\n\n")
-
-        release_capture_resp = self.photo_call("capture")
-        release_depth = np.load(DEPTH_NPY).astype(np.float32)
-        with open(CAPTURE_POSE_JSON, "r", encoding="utf-8") as file_obj:
-            release_capture_pose = json.load(file_obj)
-        release_roi = resolve_release_roi(level, release_depth.shape)
-        release_u_img, release_v_img, release_z_raw = filtered_surface_depth_in_roi(
-            release_depth, release_roi
-        )
-        save_release_debug_visualization(
-            release_depth,
-            release_roi,
-            release_u_img,
-            release_v_img,
-            release_z_raw,
-            RELEASE_DEBUG_PNG,
-        )
-
-        release_p_cam = pixel_to_camera_xyz(release_u_img, release_v_img, release_z_raw)
-        release_flange_xyz_m, release_flange_rpy_deg = pose_json_to_xyz_rpy_deg(
-            release_capture_pose
-        )
-        release_rotation = rpy_deg_to_matrix(
-            release_flange_rpy_deg[0],
-            release_flange_rpy_deg[1],
-            release_flange_rpy_deg[2],
-        )
-        t_base_release_flange = make_transform(release_rotation, release_flange_xyz_m)
-        t_base_release_cam = t_base_release_flange @ T_FLANGE_TCP @ T_TCP_CAM
-        release_surface_xyz_m = transform_point(t_base_release_cam, release_p_cam)
-
-        formal_release_flange_xyz_m, formal_release_rpy_deg = pose_cmd_to_xyz_rpy_deg(
-            formal_release_pose_cmd
-        )
-        release_target_tcp_xyz_m = flange_to_tcp_xyz(
-            formal_release_flange_xyz_m, formal_release_rpy_deg
-        )
-        release_target_tcp_xyz_m[2] = release_surface_xyz_m[2] + RELEASE_Z_CLEARANCE_M
-
-        release_target_flange_xyz_m = tcp_target_to_flange_cmd(
-            release_target_tcp_xyz_m, formal_release_rpy_deg
-        )
-        (
-            release_x_raw,
-            release_y_raw,
-            release_z_cmd,
-            release_rx_raw,
-            release_ry_raw,
-            release_rz_raw,
-        ) = pose_to_command_units(release_target_flange_xyz_m, formal_release_rpy_deg)
-        release_z_cmd = release_z_cmd if release_z_cmd > Z_PROTECT else Z_PROTECT
-
-        self.piper.MotionCtrl_2(0x01, 0x00, 30, 0x00)
-        print("正式放置点", 
-            release_x_raw,
-            release_y_raw,
-            release_z_cmd,
-            release_rx_raw,
-            release_ry_raw,
-            release_rz_raw)
-        
-        self.piper.EndPoseCtrl(
-            release_x_raw,
-            release_y_raw,
-            release_z_cmd,
-            release_rx_raw,
-            release_ry_raw,
-            release_rz_raw,
-        )
-        time.sleep(1.5)
-        print("正式放置点", self.piper.GetArmStatus(), "\n\n")
-
-        open_resp = self.gripper_call("open")
-
-        time.sleep(1)
-        print("预上抬：", 
-            release_x_raw,
-            release_y_raw,
-            release_z_cmd + 50000,
-            release_rx_raw,
-            release_ry_raw,
-            release_rz_raw)
-        
-        self.piper.EndPoseCtrl(
-            release_x_raw,
-            release_y_raw,
-            release_z_cmd + 50000,
-            release_rx_raw,
-            release_ry_raw,
-            release_rz_raw,
-        )
-
-        time.sleep(1)
-
-        print("预上抬：", self.piper.GetArmStatus(), "\n\n")
-
-        self.gripper_call("disable")
-
-        return {
-            "Level": level,
-            "pre_release_pose_cmd": pre_release_pose_cmd,
-            "formal_release_pose_cmd": formal_release_pose_cmd,
-            "gripper_close": close_resp,
-            "gripper_open": open_resp,
-            "u_img": float(u_img),
-            "v_img": float(v_img),
-            "depth_raw": float(z_raw),
-            "p_cam_m": p_cam.tolist(),
-            "current_tcp_xyz_m": cur_tcp_xyz_m.tolist(),
-            "target_tcp_xyz_m": target_tcp_xyz_m.tolist(),
-            "hover_flange_xyz_m": hover_flange_xyz_m.tolist(),
-            "release_roi": [int(value) for value in release_roi],
-            "release_capture": release_capture_resp,
-            "release_debug_png": str(RELEASE_DEBUG_PNG),
-            "release_depth_raw": float(release_z_raw),
-            "release_p_cam_m": release_p_cam.tolist(),
-            "release_surface_xyz_m": release_surface_xyz_m.tolist(),
-            "release_target_tcp_xyz_m": release_target_tcp_xyz_m.tolist(),
+        payload = {
+            "timestamp_epoch": timestamp,
+            "timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)),
+            "request": to_jsonable(req),
+            "stage": stage,
+            "exception_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "arm_pose": arm_pose,
+            "arm_status": arm_status,
+            "arm_status_error": arm_status_error,
+            "captures": {
+                "infer_json": path_debug_info(INFER_JSON),
+                "depth_npy": path_debug_info(DEPTH_NPY),
+                "capture_pose_json": path_debug_info(CAPTURE_POSE_JSON),
+                "release_debug_png": path_debug_info(RELEASE_DEBUG_PNG),
+            },
+            "debug": to_jsonable(debug_ctx),
         }
+
+        save_json_atomic(file_path, payload)
+        save_json_atomic(HOVER_ERROR_LOG_LATEST, payload)
+        print(f"[ERROR] hover grasp failed at stage={stage}, log={file_path}")
+        return file_path
+    
+    def waitMove(self, timeout=10.0, interval=0.3):
+        deadline = time.monotonic() + timeout
+
+        while True:
+            time.sleep(interval)
+            status = self.piper.GetArmStatus()
+
+            if status.arm_status.motion_status == 0x00:
+                print(f"{status.arm_status.motion_status}")
+                return
+
+            if status.arm_status.arm_status != 0x00:
+                raise RuntimeError(f"机械臂运行出错：{status}")
+
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(
+                    f"机械臂等待超时，timeout={timeout}s, 当前状态={status}"
+                )
+            
+
+    def execute_grasp(self, req: dict):
+        stage = "init"
+        debug_ctx = {
+            "request_id": req.get("id"),
+            "level": req.get("Level", req.get("level")),
+        }
+
+        try:
+            level = debug_ctx["level"]
+            pre_release_pose_cmd = resolve_pre_release_pose_cmd(
+                level,
+                # req.get("pre_release_pose_cmd", req.get("release_pose_cmd")),
+                # req.get("release_joint_cmd"),
+            )
+            formal_release_pose_cmd = resolve_formal_release_pose_cmd(
+                level,
+                # req.get("formal_release_pose_cmd"),
+                # req.get("formal_release_joint_cmd"),
+            )
+            debug_ctx["pre_release_pose_cmd"] = pre_release_pose_cmd
+            debug_ctx["formal_release_pose_cmd"] = formal_release_pose_cmd
+
+            stage = "load_grasp_inputs"
+            with open(INFER_JSON, "r", encoding="utf-8") as file_obj:
+                infer = json.load(file_obj)
+            depth = np.load(DEPTH_NPY).astype(np.float32)
+            with open(CAPTURE_POSE_JSON, "r", encoding="utf-8") as file_obj:
+                capture_pose = json.load(file_obj)
+            debug_ctx["capture_files"] = {
+                "infer_json": path_debug_info(INFER_JSON),
+                "depth_npy": path_debug_info(DEPTH_NPY),
+                "capture_pose_json": path_debug_info(CAPTURE_POSE_JSON),
+            }
+
+            stage = "compute_grasp_target"
+            u_img, v_img = map_input_to_fullres(
+                infer["u_300"],
+                infer["v_300"],
+                infer["crop_x0"],
+                infer["crop_y0"],
+                infer["crop_side"],
+                input_side=infer.get("input_side", 300),
+            )
+            z_raw = robust_depth_at(depth, u_img, v_img, radius=3)
+            p_cam = pixel_to_camera_xyz(u_img, v_img, z_raw)
+
+            
+            cap_flange_xyz_m, cap_flange_rpy_deg = pose_json_to_xyz_rpy_deg(capture_pose)   # 获取拍照时的位姿
+            cur_flange_xyz_m, cur_flange_rpy_deg = current_pose_from_piper(self.piper)
+
+            # 计算旋转矩阵
+            base_rotation = rpy_deg_to_matrix(
+                cap_flange_rpy_deg[0],
+                cap_flange_rpy_deg[1],
+                cap_flange_rpy_deg[2],
+            )
+            t_base_flange = make_transform(base_rotation, cap_flange_xyz_m) #base坐标系
+            t_base_cam = t_base_flange @ T_FLANGE_TCP @ T_TCP_CAM
+            target_tcp_xyz_m = transform_point(t_base_cam, p_cam)   #抓取点 -> base
+            hover_tcp_xyz_m = target_tcp_xyz_m.copy()
+            hover_tcp_xyz_m[2] += HOVER_Z_OFFSET_M
+
+            keep_rpy_deg = cap_flange_rpy_deg.copy()
+            cur_tcp_xyz_m = flange_to_tcp_xyz(cur_flange_xyz_m, cur_flange_rpy_deg)
+            hover_flange_xyz_m = tcp_target_to_flange_cmd(hover_tcp_xyz_m, keep_rpy_deg)
+            debug_ctx["grasp_target"] = {
+                "u_img": float(u_img),
+                "v_img": float(v_img),
+                "depth_raw": float(z_raw),
+                "p_cam_m": p_cam.tolist(),
+                "capture_flange_xyz_m": cap_flange_xyz_m.tolist(),
+                "capture_flange_rpy_deg": cap_flange_rpy_deg.tolist(),
+                "current_flange_xyz_m": cur_flange_xyz_m.tolist(),
+                "current_flange_rpy_deg": cur_flange_rpy_deg.tolist(),
+                "current_tcp_xyz_m": cur_tcp_xyz_m.tolist(),
+                "target_tcp_xyz_m": target_tcp_xyz_m.tolist(),
+                "hover_tcp_xyz_m": hover_tcp_xyz_m.tolist(),
+                "hover_flange_xyz_m": hover_flange_xyz_m.tolist(),
+            }
+
+            x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw = pose_to_command_units(
+                hover_flange_xyz_m, keep_rpy_deg
+            )
+            debug_ctx["grasp_command"] = {
+                "hover_pose_cmd_raw": [x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw],
+            }
+            self.gripper_call("enable")
+
+            stage = "move_to_grasp"
+            self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
+            z_cmd = z_cmd if z_cmd > (Z_PROTECT + math.hypot(x_raw/1000, y_raw/1000)) else Z_PROTECT
+            debug_ctx["grasp_command"]["hover_pose_cmd_raw_z_protected"] = [
+                x_raw,
+                y_raw,
+                z_cmd,
+                rx_raw,
+                ry_raw,
+                rz_raw,
+            ]
+            print("夹取点：", x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw)
+            self.piper.EndPoseCtrl(x_raw, y_raw, z_cmd, rx_raw, ry_raw, rz_raw)
+            close_resp = self.gripper_call("open")
+            self.waitMove()
+            # print("夹取点", self.piper.GetArmStatus(), "\n\n")
+
+            stage = "close_gripper"
+            close_resp = self.gripper_call("close")
+            time.sleep(CLOSE_WAIT_SEC)
+
+            stage = "lift_after_grasp"
+            print("夹取上抬：", x_raw, y_raw, z_cmd + 100000, rx_raw, ry_raw, rz_raw)
+            self.piper.EndPoseCtrl(x_raw, y_raw, z_cmd + 100000, rx_raw, ry_raw, rz_raw)
+            self.waitMove()
+            # print("夹取上抬", self.piper.GetArmStatus(), "\n\n")
+
+            stage = "move_to_pre_release"
+            print("预放置点：", *pre_release_pose_cmd)
+            self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
+            self.piper.EndPoseCtrl(*pre_release_pose_cmd)
+            self.waitMove()
+            # print("预放置点", self.piper.GetArmStatus(), "\n\n")
+
+            stage = "capture_release_scene"
+            release_capture_resp = self.photo_call("capture")
+            release_depth = np.load(DEPTH_NPY).astype(np.float32)
+            with open(CAPTURE_POSE_JSON, "r", encoding="utf-8") as file_obj:
+                release_capture_pose = json.load(file_obj)
+            debug_ctx["release_capture"] = {
+                "response": release_capture_resp,
+                "depth_npy": path_debug_info(DEPTH_NPY),
+                "capture_pose_json": path_debug_info(CAPTURE_POSE_JSON),
+            }
+
+            stage = "prepare_release_target"
+            release_roi = resolve_release_roi(level, release_depth.shape)
+            formal_release_flange_xyz_m, formal_release_rpy_deg = pose_cmd_to_xyz_rpy_deg(
+                formal_release_pose_cmd
+            )
+            release_target_tcp_xyz_m = flange_to_tcp_xyz(
+                formal_release_flange_xyz_m, formal_release_rpy_deg
+            )
+            release_local_radius_m = resolve_release_local_radius_m(level)  # 目标放置点搜索半径
+            t_base_release_cam = build_base_camera_transform(release_capture_pose)
+            projected_uv, projected_cam_xyz_m = project_base_point_to_camera_pixel(
+                release_target_tcp_xyz_m, t_base_release_cam
+            )
+            debug_ctx["release_target"] = {
+                "release_roi": [int(value) for value in release_roi],
+                "release_local_radius_m": float(release_local_radius_m),
+                "formal_release_flange_xyz_m": formal_release_flange_xyz_m.tolist(),
+                "formal_release_rpy_deg": formal_release_rpy_deg.tolist(),
+                "release_target_tcp_xyz_m":  release_target_tcp_xyz_m.tolist(),
+                "projected_uv": projected_uv.tolist(),
+                "projected_cam_xyz_m": projected_cam_xyz_m.tolist(),
+                "projected_uv_in_roi": bool(
+                    release_roi[0] <= projected_uv[0] < release_roi[2]
+                    and release_roi[1] <= projected_uv[1] < release_roi[3]
+                ),
+            }
+
+            stage = "collect_release_roi_points"
+            release_roi_points = collect_release_roi_points(
+                release_depth, release_roi, t_base_release_cam
+            )
+            roi_base_points = release_roi_points["base_points"]
+            roi_dist = np.linalg.norm(
+                roi_base_points[:, :2] - release_target_tcp_xyz_m[:2], axis=1
+            )
+            debug_ctx["release_roi_stats"] = {
+                "point_count": int(roi_base_points.shape[0]),
+                "min_target_xy_dist_m": float(np.min(roi_dist)),
+                "percentile_5_target_xy_dist_m": float(np.percentile(roi_dist, 5)),
+                "percentile_50_target_xy_dist_m": float(np.percentile(roi_dist, 50)),
+                "points_within_radius": int(
+                    np.count_nonzero(roi_dist <= release_local_radius_m)
+                ),
+            }
+
+            # 自适应Z计算
+            stage = "estimate_release_surface"
+            (
+                release_surface_xyz_m,
+                release_u_img,
+                release_v_img,
+                release_z_raw,
+                release_p_cam,
+            ) = estimate_local_surface_at_target(
+                release_roi_points,
+                release_target_tcp_xyz_m[:2],
+                release_local_radius_m,
+            )
+            save_release_debug_visualization(
+                release_depth,
+                release_roi,
+                release_u_img,
+                release_v_img,
+                release_z_raw,
+                RELEASE_DEBUG_PNG,
+            )
+            release_target_tcp_xyz_m[2] = release_surface_xyz_m[2] + RELEASE_Z_CLEARANCE_M
+            debug_ctx["release_surface"] = {
+                "release_surface_xyz_m": release_surface_xyz_m.tolist(),
+                "release_debug_u_img": float(release_u_img),
+                "release_debug_v_img": float(release_v_img),
+                "release_depth_raw": float(release_z_raw),
+                "release_p_cam_m": release_p_cam.tolist(),
+                "release_debug_png": str(RELEASE_DEBUG_PNG),
+            }
+
+            stage = "move_to_formal_release"
+            release_target_flange_xyz_m = tcp_target_to_flange_cmd(
+                release_target_tcp_xyz_m, formal_release_rpy_deg
+            )
+            (
+                release_x_raw,
+                release_y_raw,
+                release_z_cmd,
+                release_rx_raw,
+                release_ry_raw,
+                release_rz_raw,
+            ) = pose_to_command_units(release_target_flange_xyz_m, formal_release_rpy_deg)
+            release_z_cmd = release_z_cmd if release_z_cmd > Z_PROTECT else Z_PROTECT
+
+            self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
+            print(
+                "正式放置点",
+                release_x_raw,
+                release_y_raw,
+                release_z_cmd,
+                release_rx_raw,
+                release_ry_raw,
+                release_rz_raw,
+            )
+
+            self.piper.EndPoseCtrl(
+                release_x_raw,
+                release_y_raw,
+                release_z_cmd,
+                release_rx_raw,
+                release_ry_raw,
+                release_rz_raw,
+            )
+            self.waitMove()
+            time.sleep(0.1)
+            # print("正式放置点", self.piper.GetArmStatus(), "\n\n")
+
+            stage = "open_gripper_at_release"
+            open_resp = self.gripper_call("open")
+
+            stage = "lift_after_release"
+            time.sleep(0.3)
+            print(
+                "预上抬：",
+                release_x_raw,
+                release_y_raw,
+                release_z_cmd + 50000,
+                release_rx_raw,
+                release_ry_raw,
+                release_rz_raw,
+            )
+
+            self.piper.EndPoseCtrl(
+                release_x_raw,
+                release_y_raw,
+                release_z_cmd + 50000,
+                release_rx_raw,
+                release_ry_raw,
+                release_rz_raw,
+            )
+
+            self.waitMove()
+
+            # print("预上抬：", self.piper.GetArmStatus(), "\n\n")
+
+            stage = "disable_gripper"
+            self.gripper_call("disable")
+
+            return {
+                "Level": level,
+                "pre_release_pose_cmd": pre_release_pose_cmd,
+                "formal_release_pose_cmd": formal_release_pose_cmd,
+                "gripper_close": close_resp,
+                "gripper_open": open_resp,
+                "u_img": float(u_img),
+                "v_img": float(v_img),
+                "depth_raw": float(z_raw),
+                "p_cam_m": p_cam.tolist(),
+                "current_tcp_xyz_m": cur_tcp_xyz_m.tolist(),
+                "target_tcp_xyz_m": target_tcp_xyz_m.tolist(),
+                "hover_flange_xyz_m": hover_flange_xyz_m.tolist(),
+                "release_roi": [int(value) for value in release_roi],
+                "release_capture": release_capture_resp,
+                "release_debug_png": str(RELEASE_DEBUG_PNG),
+                "release_depth_raw": float(release_z_raw),
+                "release_p_cam_m": release_p_cam.tolist(),
+                "release_surface_xyz_m": release_surface_xyz_m.tolist(),
+                "release_target_tcp_xyz_m": release_target_tcp_xyz_m.tolist(),
+            }
+        except Exception as exc:
+            error_log_path = self.write_error_snapshot(req, stage, debug_ctx, exc)
+            raise RuntimeError(f"{exc} | hover_error_log={error_log_path}") from exc
 
     def handle(self, req: dict):
         req_id = req.get("id")
