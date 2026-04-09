@@ -54,7 +54,7 @@ DEFAULT_PRE_RELEASE_POSE_CMD = [221813, 128064, 252747, 180000, 17678, -150000]
 LEVEL_PRE_RELEASE_POSE_CMD = {
     "default": DEFAULT_PRE_RELEASE_POSE_CMD,
     "1": [-200409, 158528, 251952, 179844, 25004, -37527],
-    "2": [-124654, 162978, 252541, -178733, 36871, -45565],
+    "2": [-136888, 216008, 252213, 179872, 25022, -56297],
     "3": [274696, 48436, 301972, 180000, 27678, -170000],
     "4": [278933, 0, 301972, 180000, 27678, 180000],
 }
@@ -64,7 +64,7 @@ DEFAULT_FORMAL_RELEASE_POSE_CMD = list(DEFAULT_PRE_RELEASE_POSE_CMD)
 LEVEL_FORMAL_RELEASE_POSE_CMD = {
     "default": list(DEFAULT_FORMAL_RELEASE_POSE_CMD),
     "1": [-322236, 255206, 189165, 179901, 20073, -37539],
-    "2": [-251293, 339066, 171239, 180000, 27197, -45066],
+    "2": [-219543, 347715, 188851, 179901, 19955, -56498],
     "3": list(LEVEL_PRE_RELEASE_POSE_CMD["3"]),
     "4": list(LEVEL_PRE_RELEASE_POSE_CMD["4"]),
 }
@@ -73,17 +73,17 @@ LEVEL_FORMAL_RELEASE_POSE_CMD = {
 LEVEL_RELEASE_ROI = {
     "default": (784, 291, 984, 541),
     "1": (580, 70, 816, 336),
-    "2": (333, 245, 640, 418),
+    "2": (600, 120, 800, 400),
     "3": (640, 245, 947, 418),
     "4": (784, 291, 984, 541),
 }
 
 LEVEL_RELEASE_LOCAL_RADIUS_M = {
-    "default": 0.18,
-    "1": 0.18,
-    "2": 0.18,
-    "3": 0.18,
-    "4": 0.18,
+    "default": 0.01,
+    "1": 0.01,
+    "2": 0.01,
+    "3": 0.01,
+    "4": 0.01,
 }
 
 T_FLANGE_TCP = np.eye(4, dtype=np.float64)
@@ -765,7 +765,7 @@ class HoverService:
             self.gripper_call("enable")
 
             stage = "move_to_grasp"
-            self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
+            self.piper.MotionCtrl_2(0x01, 0x00, 90, 0x00)
             z_cmd = z_cmd if z_cmd > (Z_PROTECT + math.hypot(x_raw/1000, y_raw/1000)) else Z_PROTECT
             debug_ctx["grasp_command"]["hover_pose_cmd_raw_z_protected"] = [
                 x_raw,
@@ -793,7 +793,7 @@ class HoverService:
 
             stage = "move_to_pre_release"
             print("预放置点：", *pre_release_pose_cmd)
-            self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
+            self.piper.MotionCtrl_2(0x01, 0x00, 90, 0x00)
             self.piper.EndPoseCtrl(*pre_release_pose_cmd)
             self.waitMove()
             # print("预放置点", self.piper.GetArmStatus(), "\n\n")
@@ -867,14 +867,6 @@ class HoverService:
                 release_target_tcp_xyz_m[:2],
                 release_local_radius_m,
             )
-            save_release_debug_visualization(
-                release_depth,
-                release_roi,
-                release_u_img,
-                release_v_img,
-                release_z_raw,
-                RELEASE_DEBUG_PNG,
-            )
             release_target_tcp_xyz_m[2] = release_surface_xyz_m[2] + RELEASE_Z_CLEARANCE_M
             debug_ctx["release_surface"] = {
                 "release_surface_xyz_m": release_surface_xyz_m.tolist(),
@@ -897,9 +889,19 @@ class HoverService:
                 release_ry_raw,
                 release_rz_raw,
             ) = pose_to_command_units(release_target_flange_xyz_m, formal_release_rpy_deg)
+
+            save_release_debug_visualization(
+                release_depth,
+                release_roi,
+                release_u_img,
+                release_v_img,
+                release_z_cmd,
+                RELEASE_DEBUG_PNG,
+            )
+
             release_z_cmd = release_z_cmd if release_z_cmd > Z_PROTECT else Z_PROTECT
 
-            self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
+            self.piper.MotionCtrl_2(0x01, 0x00, 90, 0x00)
             print(
                 "正式放置点",
                 release_x_raw,
